@@ -171,6 +171,27 @@ class TestCategoryMatching(_MatcherBase):
         self.assertGreater(mad, other)
 
 
+class TestAccentTokenization(_MatcherBase):
+    def test_accents_are_folded_not_dropped(self):
+        self.assertEqual(matcher.tokenize("Diseñador/a de moda"), ["disenador", "a", "de", "moda"])
+        self.assertEqual(matcher.tokenize("Chófer"), ["chofer"])
+        self.assertEqual(matcher.tokenize("Conducción CAMIÓN"), ["conduccion", "camion"])
+
+    def test_ascii_tokenization_unchanged(self):
+        self.assertEqual(matcher.tokenize("Senior C++/C# Engineer, Node.js"),
+                         ["senior", "c++", "c#", "engineer", "node.js"])
+
+    def test_spanish_titles_match_categories(self):
+        m = matcher.JobMatcher(_load_profile())
+        for title, cat in [("Diseñador/a de moda", "fashion"),
+                           ("Disenador de moda", "fashion"),
+                           ("Chófer", "driver"),
+                           ("Chofer", "driver")]:
+            _, d = m.score(_job(title, ""))
+            self.assertEqual(d["category"], cat, title)
+            self.assertGreater(d["title_score"], 0.85, title)
+
+
 class TestProfileWithoutCategories(_MatcherBase):
     def test_backward_compatible(self):
         profile = {"titles": ["machine learning engineer"], "skills": ["python"],

@@ -11,6 +11,7 @@ cap the score of jobs that explicitly require something the candidate lacks.
 
 import re
 import math
+import unicodedata
 import logging
 from datetime import datetime, timedelta
 from collections import Counter
@@ -51,9 +52,15 @@ SENIORITY_LEVELS = {
 }
 
 
+def _strip_accents(text: str) -> str:
+    """Fold accents so "diseñador"/"chófer" match "disenador"/"chofer"."""
+    decomposed = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in decomposed if not unicodedata.combining(c))
+
+
 def tokenize(text: str) -> list[str]:
-    """Lowercase tokenization, strip non-alphanumeric."""
-    return re.findall(r"[a-z0-9#+\-\.]+", text.lower())
+    """Lowercase, accent-folded tokenization, strip non-alphanumeric."""
+    return re.findall(r"[a-z0-9#+\-\.]+", _strip_accents(text.lower()))
 
 
 def tf(tokens: list[str]) -> dict[str, float]:
