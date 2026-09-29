@@ -12,9 +12,11 @@ Categories may also gate which jobs belong to them (regexes, matched against
 lowercased, accent-folded text with Spanish "/a" gender suffixes removed):
   - title_include: the job title must match one of these
   - title_exclude: ...and none of these
-  - evidence_if_title / evidence: if the title matches evidence_if_title (an
-    ambiguous word like "driver"), the title+description must also match an
-    `evidence` regex, else the score is capped at evidence_max_score and flagged.
+  - evidence_rules: each rule fires when the title matches `if_title` or the
+    title+description matches `if_text`; the title+description must then match a
+    `require` regex, else the job is capped at `max_score` and flagged with
+    `reason` (or rejected, if `reject: true`). The older single-rule form
+    evidence_if_title / evidence / evidence_max_score still works.
 When any category defines title_include, jobs fitting no category score 0.
 """
 
@@ -206,11 +208,32 @@ class JobMatcher:
             "blocking_requirements": requirements,
             "title_include": [re.compile(r) for r in cat.get("title_include", []) or []],
             "title_exclude": [re.compile(r) for r in cat.get("title_exclude", []) or []],
-            "evidence_if_title": [re.compile(r) for r in cat.get("evidence_if_title", []) or []],
-            "evidence": [re.compile(r) for r in cat.get("evidence", []) or []],
-            "evidence_max_score": float(cat.get("evidence_max_score", 0.30)),
-            "evidence_reason": cat.get("evidence_reason", "No evidence the role matches this category"),
+            "evidence_rules": JobMatcher._prepare_evidence_rules(cat),
         }
+
+    @staticmethod
+    def _prepare_evidence_rules(cat: dict) -> list:
+        """Compile evidence rules: legacy evidence_if_title/evidence + evidence_rules list."""
+        def compile_all(patterns):
+            return [re.compile(r) for r in patterns or []]
+
+        raw = []
+        if cat.get("evidence_if_title"):
+            raw.append({
+                "if_title": cat["evidence_if_title"],
+                "require": cat.get("evidence", []),
+                "max_score": cat.get("evidence_max_score", 0.30),
+                "reason": cat.get("evidence_reason", "No evidence the role matches this category"),
+            })
+        raw.extend(cat.get("evidence_rules", []) or [])
+        return [{
+            "if_title": compile_all(r.get("if_title")),
+            "if_text": compile_all(r.get("if_text")),
+            "require": compile_all(r.get("require")),
+            "reject": bool(r.get("reject", False)),
+            "max_score": float(r.get("max_score", 0.30)),
+            "reason": r.get("reason", "No evidence the role matches this category"),
+        } for r in raw]
 
     @staticmethod
     def _title_fits(cat: dict, title_norm: str) -> bool:
@@ -353,11 +376,18 @@ class JobMatcher:
                     requirement_flags.append(req["reason"])
                     if req["max_score"] is not None:
                         total = min(total, req["max_score"])
-            # Ambiguous title word (e.g. "Professional Driver") needs real evidence.
-            if (any(r.search(title_norm) for r in category["evidence_if_title"])
-                    and not any(r.search(text_norm) for r in category["evidence"])):
-                requirement_flags.append(category["evidence_reason"])
-                total = min(total, category["evidence_max_score"])
+            # Triggered rules need evidence in title+description, e.g. "Professional
+            # Driver" must show real driving duties. Missing evidence caps + flags
+            # the job, or rejects it for rules marked reject.
+            for rule in category["evidence_rules"]:
+                triggered = (any(r.search(title_norm) for r in rule["if_title"])
+                             or any(r.search(text_norm) for r in rule["if_text"]))
+                if triggered and not any(r.search(text_norm) for r in rule["require"]):
+                    if rule["reject"]:
+                        rejected_reason = rule["reason"]
+                        break
+                    requirement_flags.append(rule["reason"])
+                    total = min(total, rule["max_score"])
         if rejected_reason:
             category = None
             requirement_flags = []

@@ -61,6 +61,12 @@ keywords:
 #     evidence_if_title: ['\bdrivers?\b']
 #     evidence: ['\b(vehicle|van|taxi|passengers?|delivery|carnet de conducir)\b']
 #     evidence_max_score: 0.30
+#     # Or several rules; `reject: true` rejects instead of capping:
+#     evidence_rules:
+#       - if_text: ['\b(bici|bike|moto)\b']     # fires on title+description
+#         require: ['\b(coche|car|furgoneta)\b']
+#         reject: true
+#         reason: "Bike/motorbike delivery - out of scope"
 
 # --- Search Configuration ---
 search:
