@@ -50,7 +50,7 @@ def _signal_handler(signum, frame):
 
 
 def load_profile() -> dict:
-    with open(CONFIG_PATH) as f:
+    with open(CONFIG_PATH, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 

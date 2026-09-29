@@ -27,7 +27,7 @@ CONFIG_PATH = Path(__file__).parent / "profile.yaml"
 
 
 def load_profile() -> dict:
-    with open(CONFIG_PATH) as f:
+    with open(CONFIG_PATH, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
@@ -707,7 +707,7 @@ def create_app():
     # --- Profile management APIs ---
 
     def _save_profile(profile: dict):
-        with open(CONFIG_PATH, "w") as f:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             yaml.dump(profile, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
 
     @app.route("/api/profile/queries", methods=["GET"])

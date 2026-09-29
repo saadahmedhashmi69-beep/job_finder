@@ -64,7 +64,7 @@ def load_profile() -> dict:
         logger.error(f"Profile config not found: {CONFIG_PATH}")
         logger.error("Copy profile.yaml.example to profile.yaml and edit it.")
         sys.exit(1)
-    with open(CONFIG_PATH) as f:
+    with open(CONFIG_PATH, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
