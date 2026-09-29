@@ -2,6 +2,11 @@
 
 This matcher is domain-agnostic: it scores based on the user's `profile.yaml`
 (skills/titles/keywords/locations) + optional negative keywords.
+
+Optional `categories` let one profile target unrelated job families (e.g.
+fashion design and driving). Each job is scored against the best-fitting
+category's titles/skills/keywords, and a category's `blocking_requirements`
+cap the score of jobs that explicitly require something the candidate lacks.
 """
 
 import re
@@ -128,6 +133,7 @@ class JobMatcher:
         self._negative_keywords = [kw.lower() for kw in profile.get("negative_keywords", [])]
         self._strict_specialty = bool(profile.get("strict_specialty_filter", False))
         self._preferred_regions = [r.lower() for r in profile.get("preferred_regions", [])]
+        self._categories = [self._prepare_category(c) for c in profile.get("categories", []) or []]
 
         # Load life-story for experience matching
         life_story_text = load_life_story()
@@ -158,6 +164,41 @@ class JobMatcher:
             parts.append("Background: " + life_story[:1500])
 
         return " ".join(parts)
+
+    @staticmethod
+    def _prepare_category(cat: dict) -> dict:
+        """Pre-tokenize one profile category (titles/skills/keywords/requirements)."""
+        requirements = []
+        for req in cat.get("blocking_requirements", []) or []:
+            max_score = req.get("max_score")
+            requirements.append({
+                "reason": req.get("reason", ""),
+                "patterns": [p.lower() for p in req.get("patterns", []) if p],
+                "max_score": None if max_score is None else float(max_score),
+            })
+        return {
+            "name": cat.get("name", ""),
+            "title_tfs": [tf(tokenize(t)) for t in cat.get("titles", [])],
+            "skill_tf": tf(tokenize(" ".join(cat.get("skills", [])))),
+            "keywords": [kw.lower() for kw in cat.get("keywords", [])],
+            "blocking_requirements": requirements,
+        }
+
+    @staticmethod
+    def _component_scores(title_tf, job_tf, job_text, profile_title_tfs, skill_tf, keywords):
+        """Title / skill / specialty scores against one set of profile terms.
+
+        Title score is the best match against any of the given title vectors.
+        """
+        title_score = max((cosine_sim(title_tf, t) for t in profile_title_tfs), default=0.0)
+        skill_score = cosine_sim(job_tf, skill_tf) if skill_tf else 0.0
+        # Rescale: overlap is typically 0.0–0.15, map to 0–1
+        skill_score = min(1.0, skill_score / 0.10)
+        specialty_score = 0.0
+        if keywords:
+            hits = sum(1 for kw in keywords if kw in job_text)
+            specialty_score = min(1.0, hits / 5.0)
+        return title_score, skill_score, specialty_score
 
     def is_relevant(self, job: Job) -> bool:
         """Blocklist + optional strict specialty filter."""
@@ -207,15 +248,24 @@ class JobMatcher:
         job_tf = tf(job_tokens)
 
         # 1. Title similarity — cosine similarity between desired titles and job title
-        title_tokens = tokenize(job.title)
-        title_tf = tf(title_tokens)
-        profile_title_tf = tf(self._title_tokens)
-        title_score = cosine_sim(title_tf, profile_title_tf)
-
         # 2. Skill keyword overlap — TF-IDF cosine against profile skills
-        skill_score = cosine_sim(job_tf, self._skill_tokens) if self._skill_tokens else 0.0
-        # Rescale: overlap is typically 0.0–0.15, map to 0–1
-        skill_score = min(1.0, skill_score / 0.10)
+        # 6. Specialty boost — profile keyword density
+        # With categories, use the category whose titles/keywords fit the job best.
+        title_tf = tf(tokenize(job.title))
+        category = None
+        if self._categories:
+            best = None
+            for cat in self._categories:
+                scores = self._component_scores(
+                    title_tf, job_tf, job_text, cat["title_tfs"], cat["skill_tf"], cat["keywords"])
+                key = (scores[0], scores[2], scores[1])
+                if best is None or key > best[0]:
+                    best = (key, cat, scores)
+            _, category, (title_score, skill_score, specialty_score) = best
+        else:
+            title_score, skill_score, specialty_score = self._component_scores(
+                title_tf, job_tf, job_text, [tf(self._title_tokens)],
+                self._skill_tokens, self._specialty_keywords)
 
         # 3. Semantic similarity — deep embedding-based matching
         semantic_score = self._semantic_score(job)
@@ -227,12 +277,6 @@ class JobMatcher:
         experience_score = 0.0
         if self._life_story_tf:
             experience_score = cosine_sim(job_tf, self._life_story_tf)
-
-        # 6. Specialty boost — CV/3D/robotics/perception keyword density
-        specialty_score = 0.0
-        if self._specialty_keywords:
-            hits = sum(1 for kw in self._specialty_keywords if kw in job_text)
-            specialty_score = min(1.0, hits / 5.0)
 
         # 7. Seniority fit — penalize jobs requiring more seniority than preferred
         seniority_score = self._seniority_score(job)
@@ -257,6 +301,15 @@ class JobMatcher:
             + w.get("specialty", 0.10) * specialty_score
             + w.get("remote", 0.10) * remote_score
         )
+        # Category requirements the candidate doesn't meet (e.g. a Spanish/EU
+        # driving licence) cap the score so the job never looks qualified.
+        requirement_flags = []
+        if category:
+            for req in category["blocking_requirements"]:
+                if any(p in job_text for p in req["patterns"]):
+                    requirement_flags.append(req["reason"])
+                    if req["max_score"] is not None:
+                        total = min(total, req["max_score"])
         # Final block: irrelevant jobs score 0
         if not self.is_relevant(job):
             total = 0.0
@@ -272,6 +325,8 @@ class JobMatcher:
             "specialty_score": round(specialty_score, 3),
             "remote_score": round(remote_score, 3),
             "remote_type": remote_type,
+            "category": category["name"] if category else "",
+            "requirement_flags": requirement_flags,
             "weighted_total": round(total, 3),
         }
 

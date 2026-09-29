@@ -32,6 +32,26 @@ keywords:
   - real-time
   # Add more: NLP, robotics, recommendation systems, etc.
 
+# --- Job Categories (optional) ---
+# Target unrelated job families with one profile. Each job is scored against
+# the category whose titles/skills/keywords fit it best (shown as
+# match_details.category). blocking_requirements cap the score (max_score) of
+# jobs whose title/description contains any pattern — use this for hard
+# requirements you do NOT meet. Omit max_score to flag without capping.
+# categories:
+#   - name: fashion
+#     titles: [fashion designer, apparel designer]
+#     skills: [fashion sketching, fabric selection]
+#     keywords: [fashion, apparel, garment]
+#   - name: driver
+#     titles: [driver, delivery driver, chauffeur]
+#     skills: [driving]
+#     keywords: [driver, delivery, van]
+#     blocking_requirements:
+#       - reason: "Requires a Spanish/EU driving licence"
+#         max_score: 0.30
+#         patterns: [spanish driving licence, carnet de conducir español]
+
 # --- Search Configuration ---
 search:
   # What to search for on job boards
@@ -42,6 +62,7 @@ search:
     # Add more search terms that match your target roles
 
   # Where to search — one search per location × keyword combination
+  # "City, Country" works too (e.g. "Barcelona, Spain") — Indeed/Glassdoor use the country part.
   locations:
     - "Germany"
     - "United Kingdom"

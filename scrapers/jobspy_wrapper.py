@@ -46,7 +46,14 @@ _COUNTRY_MAP = {
 
 
 def _country(location: str) -> str:
-    return _COUNTRY_MAP.get(location.lower().strip(), "USA")
+    loc = location.lower().strip()
+    if loc in _COUNTRY_MAP:
+        return _COUNTRY_MAP[loc]
+    # "Barcelona, Spain" → Spain: match the country part of "City, Country".
+    for part in reversed([p.strip() for p in loc.split(",")]):
+        if part in _COUNTRY_MAP:
+            return _COUNTRY_MAP[part]
+    return "USA"
 
 
 def _clean(value) -> str:
