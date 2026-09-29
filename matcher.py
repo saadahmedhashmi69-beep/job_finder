@@ -7,6 +7,15 @@ Optional `categories` let one profile target unrelated job families (e.g.
 fashion design and driving). Each job is scored against the best-fitting
 category's titles/skills/keywords, and a category's `blocking_requirements`
 cap the score of jobs that explicitly require something the candidate lacks.
+
+Categories may also gate which jobs belong to them (regexes, matched against
+lowercased, accent-folded text with Spanish "/a" gender suffixes removed):
+  - title_include: the job title must match one of these
+  - title_exclude: ...and none of these
+  - evidence_if_title / evidence: if the title matches evidence_if_title (an
+    ambiguous word like "driver"), the title+description must also match an
+    `evidence` regex, else the score is capped at evidence_max_score and flagged.
+When any category defines title_include, jobs fitting no category score 0.
 """
 
 import re
@@ -58,9 +67,15 @@ def _strip_accents(text: str) -> str:
     return "".join(c for c in decomposed if not unicodedata.combining(c))
 
 
+def normalize_for_match(text: str) -> str:
+    """Lowercase + accent-fold, and drop Spanish gender suffixes ("Repartidor/a" → "repartidor")."""
+    text = _strip_accents((text or "").lower())
+    return re.sub(r"\s*[/(]\s*(?:a|as|es|ora|oras)\s*\)?(?=[^a-z0-9]|$)", "", text)
+
+
 def tokenize(text: str) -> list[str]:
-    """Lowercase, accent-folded tokenization, strip non-alphanumeric."""
-    return re.findall(r"[a-z0-9#+\-\.]+", _strip_accents(text.lower()))
+    """Lowercase, accent-folded tokenization (Spanish "/a" suffixes dropped), strip non-alphanumeric."""
+    return re.findall(r"[a-z0-9#+\-\.]+", normalize_for_match(text))
 
 
 def tf(tokens: list[str]) -> dict[str, float]:
@@ -189,7 +204,20 @@ class JobMatcher:
             "skill_tf": tf(tokenize(" ".join(cat.get("skills", [])))),
             "keywords": [kw.lower() for kw in cat.get("keywords", [])],
             "blocking_requirements": requirements,
+            "title_include": [re.compile(r) for r in cat.get("title_include", []) or []],
+            "title_exclude": [re.compile(r) for r in cat.get("title_exclude", []) or []],
+            "evidence_if_title": [re.compile(r) for r in cat.get("evidence_if_title", []) or []],
+            "evidence": [re.compile(r) for r in cat.get("evidence", []) or []],
+            "evidence_max_score": float(cat.get("evidence_max_score", 0.30)),
+            "evidence_reason": cat.get("evidence_reason", "No evidence the role matches this category"),
         }
+
+    @staticmethod
+    def _title_fits(cat: dict, title_norm: str) -> bool:
+        """Title gate: must match an include regex (if any) and no exclude regex."""
+        if cat["title_include"] and not any(r.search(title_norm) for r in cat["title_include"]):
+            return False
+        return not any(r.search(title_norm) for r in cat["title_exclude"])
 
     @staticmethod
     def _component_scores(title_tf, job_tf, job_text, profile_title_tfs, skill_tf, keywords):
@@ -259,10 +287,18 @@ class JobMatcher:
         # 6. Specialty boost — profile keyword density
         # With categories, use the category whose titles/keywords fit the job best.
         title_tf = tf(tokenize(job.title))
+        title_norm = normalize_for_match(job.title)
+        text_norm = normalize_for_match(f"{job.title} {job.description}")
         category = None
+        rejected_reason = ""
         if self._categories:
+            candidates = [c for c in self._categories if self._title_fits(c, title_norm)]
+            if not candidates:
+                if any(c["title_include"] for c in self._categories):
+                    rejected_reason = "Not a target role (title outside all categories)"
+                candidates = self._categories
             best = None
-            for cat in self._categories:
+            for cat in candidates:
                 scores = self._component_scores(
                     title_tf, job_tf, job_text, cat["title_tfs"], cat["skill_tf"], cat["keywords"])
                 key = (scores[0], scores[2], scores[1])
@@ -317,6 +353,15 @@ class JobMatcher:
                     requirement_flags.append(req["reason"])
                     if req["max_score"] is not None:
                         total = min(total, req["max_score"])
+            # Ambiguous title word (e.g. "Professional Driver") needs real evidence.
+            if (any(r.search(title_norm) for r in category["evidence_if_title"])
+                    and not any(r.search(text_norm) for r in category["evidence"])):
+                requirement_flags.append(category["evidence_reason"])
+                total = min(total, category["evidence_max_score"])
+        if rejected_reason:
+            category = None
+            requirement_flags = []
+            total = 0.0
         # Final block: irrelevant jobs score 0
         if not self.is_relevant(job):
             total = 0.0
@@ -334,6 +379,7 @@ class JobMatcher:
             "remote_type": remote_type,
             "category": category["name"] if category else "",
             "requirement_flags": requirement_flags,
+            "rejected_reason": rejected_reason,
             "weighted_total": round(total, 3),
         }
 

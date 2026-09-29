@@ -51,6 +51,16 @@ keywords:
 #       - reason: "Requires a Spanish/EU driving licence"
 #         max_score: 0.30
 #         patterns: [spanish driving licence, carnet de conducir español]
+#     # Optional scope gates (regexes on lowercased, accent-folded text with
+#     # Spanish "/a" suffixes removed — write "chofer", not "chófer"). When any
+#     # category has title_include, jobs fitting no category score 0.
+#     title_include: ['\bdrivers?\b', '\b(chofer|conductor|repartidor)\b']
+#     title_exclude: ['\b(software|engineer|sales|manager)\b']
+#     # Ambiguous title words need evidence in title/description, else the
+#     # score is capped at evidence_max_score and flagged for review.
+#     evidence_if_title: ['\bdrivers?\b']
+#     evidence: ['\b(vehicle|van|taxi|passengers?|delivery|carnet de conducir)\b']
+#     evidence_max_score: 0.30
 
 # --- Search Configuration ---
 search:

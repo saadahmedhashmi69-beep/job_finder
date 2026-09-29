@@ -22,12 +22,14 @@ from scrapers.jobspy_wrapper import _country  # noqa: E402
 PROFILE_PATH = PROJECT_ROOT / "profile.yaml"
 
 FASHION_QUERIES = [
-    "Fashion Designer", "Fashion Design", "Womenswear Designer", "Apparel Designer",
-    "Garment Designer", "Fashion Design Assistant", "Fashion Product Developer",
+    "Fashion Designer", "Fashion Design", "Womenswear Designer", "Ladieswear Designer",
+    "Apparel Designer", "Garment Designer", "Fashion Design Assistant",
+    "Diseñador de moda", "Diseñador de ropa",
 ]
 DRIVER_QUERIES = [
     "Driver", "Professional Driver", "Delivery Driver", "Van Driver",
-    "Company Driver", "Chauffeur",
+    "Uber Driver", "Taxi Driver", "Cab Driver", "Private Driver", "Chauffeur",
+    "Conductor", "Chófer", "Taxista", "Repartidor",
 ]
 
 
@@ -173,7 +175,8 @@ class TestCategoryMatching(_MatcherBase):
 
 class TestAccentTokenization(_MatcherBase):
     def test_accents_are_folded_not_dropped(self):
-        self.assertEqual(matcher.tokenize("Diseñador/a de moda"), ["disenador", "a", "de", "moda"])
+        # Spanish "/a" gender suffix is dropped too.
+        self.assertEqual(matcher.tokenize("Diseñador/a de moda"), ["disenador", "de", "moda"])
         self.assertEqual(matcher.tokenize("Chófer"), ["chofer"])
         self.assertEqual(matcher.tokenize("Conducción CAMIÓN"), ["conduccion", "camion"])
 
