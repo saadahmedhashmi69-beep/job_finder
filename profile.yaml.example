@@ -116,6 +116,9 @@ pipeline:
   email_recipient: "you@example.com"   # Where to send job digest emails
   email_digest_interval_days: 2        # How often to send digest
   cv_dir: "./cv"               # Where your LaTeX CV files live (relative to project root, or absolute)
+  # Fixed CV PDF attached to EVERY application (never generated/customized).
+  # Relative to project root, or absolute.
+  fixed_cv_path: "cv/Raheel Tahir Resume Updated.pdf"
   ollama_model: "qwen3.5:9b"   # Set by setup_ollama.sh based on your hardware
   # Gmail credentials go in .env:
   #   GMAIL_USER=you@gmail.com

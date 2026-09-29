@@ -11,6 +11,7 @@ import json
 import logging
 from typing import Dict, List, Optional
 
+from fixed_cv import resolve_fixed_cv_path
 from storage import get_application_by_job
 from user_profile import load_person, split_name
 
@@ -60,7 +61,7 @@ def get_fill_instructions(job_url: str) -> Optional[Dict]:
     Returns a dict with:
     - static_fields: field name -> value (always the same)
     - dynamic_fields: question -> answer (from pre-generated form answers)
-    - cv_pdf_path: path to customized CV for upload
+    - cv_pdf_path: path to the fixed CV PDF for upload (never per-job)
     - cover_letter_pdf_path: path to cover letter for upload
     - application_url: the job URL to navigate to
     """
@@ -80,7 +81,7 @@ def get_fill_instructions(job_url: str) -> Optional[Dict]:
         "application_url": job_url,
         "static_fields": _static_field_mappings(),
         "dynamic_fields": answers,
-        "cv_pdf_path": app.get("cv_pdf_path", ""),
+        "cv_pdf_path": str(resolve_fixed_cv_path()),
         "cover_letter_pdf_path": app.get("cover_letter_pdf_path", ""),
         "status": app.get("status", "unknown"),
         "slug": app.get("slug", ""),

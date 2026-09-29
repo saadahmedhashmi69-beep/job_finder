@@ -362,7 +362,7 @@ def create_app():
 
     @app.route("/api/generate-application", methods=["POST"])
     def api_generate_application():
-        """Generate customized CV + cover letter for a job (runs in background thread)."""
+        """Attach the fixed CV and generate cover letter + form answers (background thread)."""
         data = request.json or {}
         url = data.get("url", "")
         if not url:
@@ -378,7 +378,8 @@ def create_app():
 
         def generate():
             try:
-                from cv_customizer import customize_cv_for_job, analyze_job, LIFE_STORY_PATH
+                from cv_customizer import analyze_job, LIFE_STORY_PATH
+                from fixed_cv import prepare_fixed_cv_application
                 from cover_letter import create_cover_letter
                 from form_answers import generate_form_answers as gen_answers
                 from storage import create_application, update_application
@@ -386,13 +387,12 @@ def create_app():
                 profile = load_profile()
                 model = profile.get("pipeline", {}).get("ollama_model", "qwen3.5:9b")
 
-                result = customize_cv_for_job(
+                # Fixed CV — never customized per job
+                result = prepare_fixed_cv_application(
                     job_url=job["url"], title=job["title"],
                     company=job["company"], location=job.get("location", ""),
-                    description=job.get("description", ""), model=model,
+                    description=job.get("description", ""), profile=profile,
                 )
-                if not result:
-                    return
 
                 app_id = create_application(job["url"], result["slug"])
                 update_application(app_id, status="cv_generated", cv_pdf_path=result["cv_pdf_path"])
@@ -472,16 +472,21 @@ def create_app():
         if not dry_run and not to_email:
             return jsonify({"status": "error", "error": "Recruiter email required"}), 400
 
-        # Prepare attachments from application directory
-        if not app_row.get("cv_pdf_path"):
-            return jsonify({"status": "error", "error": "CV not generated yet"}), 400
-        app_dir = Path(app_row["cv_pdf_path"]).parent
-        package = prepare_application_package(app_dir)
-        if not package.get("cv"):
-            return jsonify({"status": "error", "error": "CV PDF not found"}), 400
+        # CV is always the fixed PDF; the app dir only supplies the cover letter.
+        from fixed_cv import resolve_fixed_cv_path, application_dir_for_slug, FixedCVMissingError
+        profile = load_profile()
+        try:
+            fixed_cv = resolve_fixed_cv_path(profile)
+        except FixedCVMissingError as e:
+            return jsonify({"status": "error", "error": str(e)}), 400
+        if app_row.get("cover_letter_pdf_path"):
+            app_dir = Path(app_row["cover_letter_pdf_path"]).parent
+        else:
+            app_dir = application_dir_for_slug(app_row.get("slug") or "", profile)
+        package = prepare_application_package(app_dir, fixed_cv)
 
         # Use cover-letter.md (if present) as email body
-        subject = app_row.get("email_subject") or f"Application for {app_row['title']} - Ibrahim Abdullaziz"
+        subject = app_row.get("email_subject") or f"Application for {app_row['title']} - Raheel Tahir"
         md_cl = app_dir / "cover-letter.md"
         body = ""
         if md_cl.exists():
@@ -489,7 +494,7 @@ def create_app():
         if not body:
             body = (
                 f"Hello,\n\nPlease find my application for the {app_row['title']} position at "
-                f"{app_row['company']}.\n\nBest regards,\nIbrahim Abdullaziz"
+                f"{app_row['company']}.\n\nBest regards,\nRaheel Tahir"
             )
 
         if dry_run:
@@ -503,7 +508,6 @@ def create_app():
             )
 
             # Send a review email to YOU with attachments.
-            profile = load_profile()
             recipient = profile.get("pipeline", {}).get("email_recipient") or ""
             if recipient:
                 try:

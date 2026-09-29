@@ -1,6 +1,7 @@
 """Pipeline orchestrator — background daemon for automated job application.
 
-Runs the full loop: scrape → match → customize CV → cover letter → form answers → email.
+Runs the full loop: scrape → match → fixed CV → cover letter → form answers → email.
+The CV attachment is always the fixed PDF from pipeline.fixed_cv_path (see fixed_cv.py).
 Can run as a one-shot or as a daemon on a 2-day interval.
 """
 
@@ -27,7 +28,8 @@ from storage import (
     start_pipeline_run, finish_pipeline_run,
     get_new_jobs_since, get_last_email_sent,
 )
-from cv_customizer import customize_cv_for_job, LIFE_STORY_PATH
+from cv_customizer import LIFE_STORY_PATH
+from fixed_cv import prepare_fixed_cv_application, resolve_fixed_cv_path
 from cover_letter import create_cover_letter
 from form_answers import generate_form_answers
 from notifier import send_digest_email, should_send_digest
@@ -179,6 +181,9 @@ def run_pipeline(
 
         # --- Step 3: Generate applications ---
         logger.info("=== Pipeline Step 3: Generating applications ===")
+        # Fail clearly up front if the fixed CV is missing.
+        fixed_cv = resolve_fixed_cv_path(profile)
+        logger.info("Using fixed CV for all applications: %s", fixed_cv)
         life_story = ""
         if LIFE_STORY_PATH.exists():
             life_story = LIFE_STORY_PATH.read_text(encoding="utf-8")
@@ -199,19 +204,15 @@ def run_pipeline(
                 continue
 
             try:
-                # Generate customized CV
-                cv_result = customize_cv_for_job(
+                # Fixed CV — never customized per job
+                cv_result = prepare_fixed_cv_application(
                     job_url=job["url"],
                     title=job["title"],
                     company=job["company"],
                     location=job.get("location", ""),
                     description=job.get("description", ""),
-                    model=model,
+                    profile=profile,
                 )
-
-                if not cv_result:
-                    log_lines.append(f"FAILED CV: {job['title']} at {job['company']}")
-                    continue
 
                 # Create application record
                 app_id = create_application(job["url"], cv_result["slug"])

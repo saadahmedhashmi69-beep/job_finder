@@ -17,19 +17,19 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
-def prepare_application_package(app_dir: Path) -> dict:
-    """Find generated files in an application directory."""
-    cv_path = app_dir / "cv-llt.pdf"
-    cl_path = app_dir / "cover-letter.pdf"
+def prepare_application_package(app_dir: Path, cv_path: Path) -> dict:
+    """Build the attachment set for an application.
 
-    # Fallback: pick any PDF that looks like CV if cv-llt.pdf isn't present.
-    if not cv_path.exists():
-        pdfs = list(app_dir.glob("*.pdf"))
-        if pdfs:
-            cv_path = pdfs[0]
+    The CV is always the explicitly supplied fixed CV path; PDFs found in
+    `app_dir` are never used as the CV. Only the cover letter comes from `app_dir`.
+    """
+    cv_path = Path(cv_path)
+    if not cv_path.is_file():
+        raise FileNotFoundError(f"Fixed CV PDF not found: {cv_path}")
+    cl_path = Path(app_dir) / "cover-letter.pdf"
 
     return {
-        "cv": cv_path if cv_path.exists() else None,
+        "cv": cv_path,
         "cover_letter": cl_path if cl_path.exists() else None,
     }
 
@@ -52,6 +52,7 @@ def send_application_email(
         logger.error("GMAIL_USER or GMAIL_APP_PASSWORD not set.")
         return False
 
+    cv_path = Path(cv_path)
     if not cv_path.exists():
         logger.error("CV not found: %s", cv_path)
         return False
