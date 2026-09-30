@@ -72,7 +72,8 @@ class TestProfileLoadsUtf8(unittest.TestCase):
 
     def test_app_save_profile_round_trip(self):
         # Saving via the UI must keep the file UTF-8 so later loads still work.
-        with mock.patch.object(app_module, "CONFIG_PATH", self.path):
+        with mock.patch.object(app_module, "CONFIG_PATH", self.path), \
+                mock.patch("submitter.demote_unverified_submissions"):  # never touch the real jobs.db
             client = app_module.create_app().test_client()
             resp = client.post("/api/profile/queries", json={"query": "Repartidor/a camión"})
             self.assertEqual(resp.status_code, 200)

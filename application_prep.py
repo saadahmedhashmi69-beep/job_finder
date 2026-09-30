@@ -44,7 +44,21 @@ SUPPORTED_ATS_HOSTS = {
 LOGIN_WALLED_HOSTS = ("linkedin.com", "indeed.com", "glassdoor.", "infojobs.net")
 
 _EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
-_BAD_EMAIL = re.compile(r"(no-?reply|donotreply|example\.(com|org)|@sentry|\.png$|\.jpg$)", re.I)
+_BAD_EMAIL = re.compile(r"(no-?reply|donotreply|@sentry|\.png$|\.jpg$)", re.I)
+# Placeholder / test recipients are never legitimate application addresses.
+_PLACEHOLDER_DOMAIN = re.compile(
+    r"(^|\.)(example\.(com|org|net)|localhost|localdomain|test\.com|domain\.com|"
+    r"yourdomain\.com|yourcompany\.com|mailinator\.com)$|\.(test|invalid|example|localhost|local)$", re.I)
+_PLACEHOLDER_LOCAL = re.compile(
+    r"^(test|testing|tester|placeholder|dummy|fake|sample|example|your\.?e?-?mail|your\.?name|"
+    r"name|someone|john\.?doe|jane\.?doe|foo|bar|asdf|xxx+)$", re.I)
+
+
+def is_placeholder_email(email: str) -> bool:
+    """True for example/test/localhost/placeholder addresses."""
+    local, _, domain = (email or "").strip().lower().rpartition("@")
+    return (not local or not domain or bool(_PLACEHOLDER_DOMAIN.search(domain))
+            or bool(_PLACEHOLDER_LOCAL.match(local)))
 
 
 def sha256_file(path: Path) -> str:
@@ -131,13 +145,19 @@ def generate_form_answers(job: Dict, profile: Dict, category: str, cover_letter:
 # --- Application method ------------------------------------------------------
 
 def find_application_email(job: Dict, recruiter_email: str = "") -> str:
-    """A legitimate email: the one set on the application, or one printed in
-    the job posting itself. Never guessed."""
-    for candidate in [recruiter_email] + _EMAIL_RE.findall(job.get("description") or ""):
-        candidate = (candidate or "").strip().rstrip(".")
-        if candidate and _EMAIL_RE.fullmatch(candidate) and not _BAD_EMAIL.search(candidate):
+    """A legitimate email printed in the job posting itself. A recruiter_email
+    set on the application is used only if the posting contains it too.
+    Placeholder/test addresses are rejected; nothing is ever guessed."""
+    posted = []
+    for candidate in _EMAIL_RE.findall(job.get("description") or ""):
+        candidate = candidate.strip().rstrip(".")
+        if not _BAD_EMAIL.search(candidate) and not is_placeholder_email(candidate):
+            posted.append(candidate)
+    wanted = (recruiter_email or "").strip().lower()
+    for candidate in posted:
+        if candidate.lower() == wanted:
             return candidate
-    return ""
+    return posted[0] if posted else ""
 
 
 def detect_application_method(job: Dict, recruiter_email: str = "") -> Dict:

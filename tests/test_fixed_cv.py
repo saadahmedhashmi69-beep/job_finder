@@ -36,7 +36,7 @@ FASHION_JOB = {
     "title": "Fashion Designer",
     "company": "Atelier Co",
     "location": "Lahore, Pakistan",
-    "description": "Design womenswear collections, sketching, pattern making.",
+    "description": "Design womenswear collections, sketching, pattern making. Send your CV to careers@acme-jobs.es",
     "match_score": 0.9,
 }
 DRIVER_JOB = {
@@ -44,7 +44,7 @@ DRIVER_JOB = {
     "title": "Delivery Driver",
     "company": "FastMove Logistics",
     "location": "Karachi, Pakistan",
-    "description": "Drive company van, valid driving licence required.",
+    "description": "Drive company van, valid driving licence required. Send your CV to careers@acme-jobs.es",
     "match_score": 0.8,
 }
 
@@ -197,6 +197,11 @@ class TestAppFlows(FixedCVTestBase):
 
         patches = [
             mock.patch.object(app_module, "get_db", side_effect=self.get_db),
+            # Writes must hit the temp DB too, never the real jobs.db.
+            mock.patch.object(app_module, "update_application",
+                              side_effect=lambda app_id, **kw: storage.update_application(
+                                  app_id, db_path=self.db_path, **kw)),
+            mock.patch("submitter.demote_unverified_submissions"),
             mock.patch.object(app_module, "load_profile", return_value=self.profile),
         ]
         for p in patches:
@@ -209,7 +214,7 @@ class TestAppFlows(FixedCVTestBase):
         slug = cv_customizer._slugify(f"{job['company']}-{job['title']}")
         cur = conn.execute(
             "INSERT INTO applications (job_url, slug, status, cv_pdf_path, cover_letter_pdf_path, "
-            "recruiter_email) VALUES (?, ?, 'READY_TO_SUBMIT', ?, ?, 'hr@example.com')",
+            "recruiter_email) VALUES (?, ?, 'READY_TO_SUBMIT', ?, ?, 'careers@acme-jobs.es')",
             (job["url"], slug, cv_pdf_path, cover_letter_pdf_path),
         )
         conn.commit()
@@ -259,7 +264,7 @@ class TestAppFlows(FixedCVTestBase):
         with mock.patch.object(applier, "send_application_email", return_value=True) as send:
             resp = self.client.post(
                 "/api/application/approve-send",
-                json={"app_id": app_id, "recruiter_email": "hr@example.com"},
+                json={"app_id": app_id, "recruiter_email": "careers@acme-jobs.es"},
             )
         self.assertEqual(resp.status_code, 200, resp.get_json())
         send.assert_called_once()
@@ -298,7 +303,7 @@ class TestAppFlows(FixedCVTestBase):
         with mock.patch.object(applier, "send_application_email") as send:
             resp = self.client.post(
                 "/api/application/approve-send",
-                json={"app_id": app_id, "recruiter_email": "hr@example.com"},
+                json={"app_id": app_id, "recruiter_email": "careers@acme-jobs.es"},
             )
         self.assertEqual(resp.status_code, 400)
         self.assertIn("Fixed CV PDF not found", resp.get_json()["error"])

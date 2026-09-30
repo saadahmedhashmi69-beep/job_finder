@@ -29,7 +29,7 @@ import storage  # noqa: E402
 import submitter  # noqa: E402
 from qualification import (  # noqa: E402
     MANUAL_REQUIRED, NEEDS_REVIEW, QUALIFIED, READY_TO_SUBMIT, REJECTED,
-    SUBMISSION_FAILED, SUBMITTED, qualify_job,
+    SMTP_ACCEPTED, SUBMISSION_FAILED, SUBMITTED, UNVERIFIED_LEGACY, qualify_job,
 )
 
 FIXED_CV = (PROJECT_ROOT / "cv" / "Raheel Tahir Resume Updated.pdf").resolve()
@@ -282,6 +282,9 @@ class TestSubmission(WorkflowBase):
         res = self.submit(app_id, FakePage(SIMPLE_FORM, after_html="<h1>Thank you for applying!</h1>"))
         self.assertEqual(res["status"], SUBMITTED)
         self.assertTrue(self.app_row(app_id)["submitted_at"])
+        # A confirmed WEB submission satisfies the contract and is never demoted.
+        self.assertEqual(submitter.demote_unverified_submissions(self.db), 0)
+        self.assertEqual(self.app_row(app_id)["status"], SUBMITTED)
 
     def test_captcha_login_and_unknown_required_fields_are_manual(self):
         self.enable_live()
@@ -325,6 +328,119 @@ class TestSubmission(WorkflowBase):
         res = self.submit(first["app_id"], page)
         self.assertIn("duplicate", res["reason"].lower())
         self.assertFalse(page.clicked)
+
+
+LEGIT_EMAIL_JOB = dict(DRIVER, url="https://www.linkedin.com/jobs/view/77",
+                       description=DRIVER["description"] + " Envia tu CV a empleo@repartorapido.es")
+
+
+class TestApplicationRecipients(WorkflowBase):
+    def test_placeholder_emails_are_rejected(self):
+        for bad in ("hr@example.com", "jobs@example.org", "rrhh@example.net", "hr@localhost",
+                    "hr@mail.example.com", "jobs@acme.test", "test@repartorapido.es",
+                    "placeholder@acme.es", "your.email@acme.es", "john.doe@acme.es"):
+            self.assertTrue(application_prep.is_placeholder_email(bad), bad)
+            job = dict(DRIVER, url="https://www.linkedin.com/jobs/view/9",
+                       description=f"Conduccion de furgoneta. Envia tu CV a {bad}")
+            self.assertEqual(application_prep.find_application_email(job, bad), "", bad)
+            self.assertEqual(application_prep.detect_application_method(job)["method"], MANUAL_REQUIRED, bad)
+        self.assertFalse(application_prep.is_placeholder_email("empleo@repartorapido.es"))
+
+    def test_email_must_come_from_posting(self):
+        # A recipient set on the application but absent from the posting is never used.
+        self.assertEqual(application_prep.find_application_email(DRIVER, "hr@example.com"), "")
+        self.assertEqual(application_prep.find_application_email(DRIVER, "rrhh@otra-empresa.es"), "")
+        self.assertEqual(application_prep.find_application_email(LEGIT_EMAIL_JOB, "rrhh@otra-empresa.es"),
+                         "empleo@repartorapido.es")
+
+    def test_placeholder_recipient_on_application_is_manual_required(self):
+        r = self.prepare(dict(DRIVER, url="https://www.linkedin.com/jobs/view/5"))
+        self.assertEqual(r["status"], MANUAL_REQUIRED)
+        storage.update_application(r["app_id"], db_path=self.db, status=READY_TO_SUBMIT,
+                                   application_method="EMAIL", recruiter_email="hr@example.com")
+        self.profile["pipeline"].update({"submission_mode": "LIVE", "allow_live_submission": True})
+        sender = mock.Mock(return_value=True)
+        res = submitter.submit_application(r["app_id"], self.profile, email_sender=sender, db_path=self.db)
+        self.assertEqual(res["status"], MANUAL_REQUIRED)
+        sender.assert_not_called()
+
+    def test_legitimate_posting_email_reaches_ready_in_dry_run_without_sending(self):
+        r = self.prepare(LEGIT_EMAIL_JOB)
+        app = self.app_row(r["app_id"])
+        self.assertEqual((app["status"], app["application_method"], app["recruiter_email"]),
+                         (READY_TO_SUBMIT, "EMAIL", "empleo@repartorapido.es"))
+        self.assertEqual(Path(app["cv_pdf_path"]).resolve(), FIXED_CV)
+        sender = mock.Mock(return_value=True)
+        with mock.patch("applier.send_application_email", side_effect=AssertionError("email sent")):
+            res = submitter.submit_application(r["app_id"], self.profile, email_sender=sender, db_path=self.db)
+        self.assertEqual(res["status"], submitter.DRY_RUN_VALIDATED)
+        sender.assert_not_called()
+        app = self.app_row(r["app_id"])
+        self.assertEqual(app["status"], READY_TO_SUBMIT)
+        self.assertEqual((app["sent_at"], app["submitted_at"]), ("", ""))
+
+    def test_smtp_acceptance_is_not_a_verified_submission(self):
+        r = self.prepare(LEGIT_EMAIL_JOB)
+        self.profile["pipeline"].update({"submission_mode": "LIVE", "allow_live_submission": True})
+        sender = mock.Mock(return_value=True)  # stands in for SMTP; nothing is sent
+        res = submitter.submit_application(r["app_id"], self.profile, email_sender=sender, db_path=self.db)
+        self.assertEqual(res["status"], SMTP_ACCEPTED)
+        app = self.app_row(r["app_id"])
+        self.assertEqual((app["status"], app["submission_status"], app["submitted_at"]),
+                         (SMTP_ACCEPTED, SMTP_ACCEPTED, ""))
+        self.assertTrue(app["sent_at"])
+        self.assertFalse(submitter.is_verified_submission(dict(app, qualification_status=QUALIFIED)))
+        conn = storage.get_db(self.db)
+        self.assertEqual(conn.execute("SELECT applied FROM jobs WHERE url = ?",
+                                      (LEGIT_EMAIL_JOB["url"],)).fetchone()[0], 0)
+        conn.close()
+
+
+class TestLegacySubmissions(WorkflowBase):
+    MINGA = {"url": "https://www.linkedin.com/jobs/view/minga", "title": "Senior Womenswear Fashion Designer",
+             "company": "Minga London", "location": "London", "board": "linkedin", "match_score": 0.9,
+             "description": "Womenswear designer."}
+
+    def insert_minga_legacy(self):
+        self.insert(self.MINGA)
+        conn = storage.get_db(self.db)
+        conn.execute("UPDATE jobs SET applied = 1 WHERE url = ?", (self.MINGA["url"],))
+        conn.commit()
+        conn.close()
+        app_id = storage.create_application(self.MINGA["url"], "minga", db_path=self.db)
+        storage.update_application(
+            app_id, db_path=self.db, status="review_sent", submission_status=SUBMITTED, submission_mode="LIVE",
+            recruiter_email="hr@example.com", status_reason="Email accepted by SMTP for hr@example.com",
+            submitted_at="2026-09-30T07:58:27", sent_at="2026-09-30T07:58:27")
+        return app_id
+
+    def test_legacy_submitted_record_is_not_a_genuine_submission(self):
+        app_id = self.insert_minga_legacy()
+        self.assertEqual(submitter.demote_unverified_submissions(self.db), 1)
+        app = self.app_row(app_id)
+        self.assertEqual((app["status"], app["submission_status"], app["submitted_at"]),
+                         (UNVERIFIED_LEGACY, UNVERIFIED_LEGACY, ""))
+        self.assertEqual(app["submission_evidence"], "")  # nothing fabricated
+        self.assertFalse(submitter.is_verified_submission(app))
+        conn = storage.get_db(self.db)
+        self.assertEqual(conn.execute("SELECT applied FROM jobs WHERE url = ?",
+                                      (self.MINGA["url"],)).fetchone()[0], 0)
+        conn.close()
+        self.assertEqual(submitter.demote_unverified_submissions(self.db), 0)  # idempotent
+
+    def test_applications_page_does_not_show_legacy_as_submitted(self):
+        import app as app_module
+        self.insert_minga_legacy()
+        real_demote = submitter.demote_unverified_submissions
+        with mock.patch.object(submitter, "demote_unverified_submissions", lambda: real_demote(self.db)), \
+                mock.patch.object(app_module, "get_applications",
+                                  lambda limit=50: storage.get_applications(limit=limit, db_path=self.db)), \
+                mock.patch.object(storage, "get_jobs_by_qualification", return_value=[]):
+            html = app_module.create_app().test_client().get("/applications").get_data(as_text=True)
+        self.assertNotIn("Minga London", html)
+        self.assertNotIn("hr@example.com", html)
+        self.assertNotIn(">SUBMITTED", html)
+        self.assertIn("1 legacy record(s)", html)
 
 
 if __name__ == "__main__":

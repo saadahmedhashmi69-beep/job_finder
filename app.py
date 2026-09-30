@@ -33,6 +33,12 @@ def load_profile() -> dict:
 
 def create_app():
     app = Flask(__name__, template_folder="templates", static_folder="static")
+    try:
+        # Legacy/test rows claiming SUBMITTED without verified evidence are not shown as submissions.
+        from submitter import demote_unverified_submissions
+        demote_unverified_submissions()
+    except Exception as e:
+        logger.error("Could not reclassify unverified submissions: %s", e)
 
     @app.route("/")
     def dashboard():
@@ -442,7 +448,7 @@ def create_app():
 
         conn = get_db()
         row = conn.execute(
-            """SELECT a.*, j.title, j.company, j.location, j.url as job_url
+            """SELECT a.*, j.title, j.company, j.location, j.description, j.url as job_url
                FROM applications a JOIN jobs j ON a.job_url = j.url
                WHERE a.id = ?""",
             (int(app_id),),
@@ -461,9 +467,13 @@ def create_app():
                 return jsonify({"status": "error", "error": f"Not sendable (status {app_row.get('status')}); "
                                 "only qualified READY_TO_SUBMIT applications, never twice."}), 400
         to_email = recruiter_email or (app_row.get("recruiter_email") or "").strip()
-        # For dry_run (review email), recruiter email is optional.
-        if not dry_run and not to_email:
-            return jsonify({"status": "error", "error": "Recruiter email required"}), 400
+        if not dry_run:
+            # Only a legitimate (non-placeholder) address printed in the posting.
+            from application_prep import find_application_email
+            to_email = find_application_email(app_row, to_email)
+            if not to_email:
+                return jsonify({"status": "error", "error": "MANUAL_REQUIRED: no legitimate application "
+                                "email in the job posting"}), 400
 
         # CV is always the fixed PDF; the app dir only supplies the cover letter.
         from fixed_cv import resolve_fixed_cv_path, application_dir_for_slug, FixedCVMissingError
@@ -538,9 +548,11 @@ def create_app():
         )
 
         if ok:
-            update_application(int(app_id), status="SUBMITTED", submission_status="SUBMITTED",
-                               submission_mode="LIVE", status_reason=f"Email accepted by SMTP for {to_email}",
-                               sent_at=_dt.now().isoformat(), submitted_at=_dt.now().isoformat())
+            # SMTP acceptance is not a verified submission.
+            update_application(int(app_id), status="SMTP_ACCEPTED", submission_status="SMTP_ACCEPTED",
+                               submission_mode="LIVE",
+                               status_reason=f"Email accepted by SMTP for {to_email}; not a verified submission",
+                               sent_at=_dt.now().isoformat())
             return jsonify({"status": "ok", "sent": True})
         return jsonify({"status": "error", "error": "Failed to send email"}), 500
 

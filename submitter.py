@@ -29,7 +29,8 @@ import storage
 from application_prep import EMAIL, WEB, find_application_email, sha256_file
 from fixed_cv import resolve_fixed_cv_path
 from qualification import (
-    MANUAL_REQUIRED, READY_TO_SUBMIT, SUBMISSION_FAILED, SUBMITTED,
+    MANUAL_REQUIRED, QUALIFIED, READY_TO_SUBMIT, SMTP_ACCEPTED, SUBMISSION_FAILED, SUBMITTED,
+    UNVERIFIED_LEGACY,
 )
 
 logger = logging.getLogger(__name__)
@@ -252,7 +253,9 @@ def submit_application(app_id: int, profile: Dict, *, mode: Optional[str] = None
         ok = sender(to_email=to, subject=app.get("email_subject") or f"Application for {app['title']}",
                     body=app.get("email_body") or "", cv_path=cv_path, cover_letter_path=None)
         if ok:
-            return _record(app_id, db, mode, SUBMITTED, f"Email accepted by SMTP server for {to}", to)
+            # SMTP acceptance is not proof that an application was received.
+            return _record(app_id, db, mode, SMTP_ACCEPTED,
+                           f"Email accepted by SMTP server for {to}; not a verified submission")
         return _record(app_id, db, mode, SUBMISSION_FAILED, "Email sending failed")
 
     return _record(app_id, db, mode, MANUAL_REQUIRED, "No supported application method")
@@ -266,6 +269,8 @@ def _record(app_id: int, db: Path, mode: str, outcome: str, reason: str, evidenc
         fields["status"] = outcome
     if outcome == SUBMITTED:
         fields["submitted_at"] = datetime.now().isoformat()
+    if outcome == SMTP_ACCEPTED:
+        fields["sent_at"] = datetime.now().isoformat()
     storage.update_application(app_id, db_path=db, **fields)
     if outcome == SUBMITTED:
         conn = storage.get_db(db)
@@ -274,3 +279,47 @@ def _record(app_id: int, db: Path, mode: str, outcome: str, reason: str, evidenc
         conn.commit()
         conn.close()
     return {"status": outcome, "reason": reason, "evidence": evidence, "mode": mode}
+
+
+# --- Verified-submission contract ---------------------------------------------
+
+def is_verified_submission(app: Dict) -> bool:
+    """A genuine SUBMITTED application under the current contract: QUALIFIED job,
+    fixed-CV checksum, WEB method and observable confirmation evidence.
+    EMAIL can never be verified (SMTP acceptance only)."""
+    return (app.get("status") == SUBMITTED and app.get("submission_status") == SUBMITTED
+            and bool(app.get("submission_evidence")) and bool(app.get("cv_sha256"))
+            and app.get("application_method") == WEB
+            and app.get("qualification_status") == QUALIFIED)
+
+
+def demote_unverified_submissions(db_path: Optional[Path] = None) -> int:
+    """Reclassify rows that claim SUBMITTED but fail the contract above.
+
+    Legacy/test rows become UNVERIFIED_LEGACY; current-workflow EMAIL rows become
+    SMTP_ACCEPTED. Their job is no longer flagged applied. No evidence is invented.
+    Returns the number of rows reclassified.
+    """
+    db = db_path or storage.DB_PATH
+    conn = storage.get_db(db)
+    rows = [dict(r) for r in conn.execute(
+        """SELECT a.*, j.qualification_status FROM applications a LEFT JOIN jobs j ON a.job_url = j.url
+           WHERE a.status = ? OR a.submission_status = ?""", (SUBMITTED, SUBMITTED))]
+    conn.close()
+    demoted = 0
+    for app in rows:
+        if is_verified_submission(app):
+            continue
+        current = (app.get("application_method") == EMAIL and app.get("cv_sha256")
+                   and app.get("qualification_status") == QUALIFIED)
+        state = SMTP_ACCEPTED if current else UNVERIFIED_LEGACY
+        storage.update_application(
+            app["id"], db_path=db, status=state, submission_status=state, submitted_at="",
+            status_reason=f"{state}: not a verified submission (was: {app.get('status_reason') or 'no reason'})")
+        conn = storage.get_db(db)
+        conn.execute("UPDATE jobs SET applied = 0 WHERE url = ?", (app["job_url"],))
+        conn.commit()
+        conn.close()
+        demoted += 1
+        logger.warning("Application #%s reclassified %s (no verified submission)", app["id"], state)
+    return demoted
