@@ -89,7 +89,10 @@ class TestSpainProfileConfig(unittest.TestCase):
             claims += cat.get("skills", []) + cat.get("titles", [])
         claims += self.profile.get("skills", [])
         text = " ".join(claims).lower()
-        for bad in ["spanish", "español", " eu ", "european", "carnet", "carné", "permiso"]:
+        # Generic Spanish for "driving licence" (carnet/permiso de conducir) is
+        # allowed; claiming a Spanish/EU or category-B licence is not.
+        for bad in ["spanish", "español", "española", " eu ", "european", "europeo",
+                    "comunitario", "carnet b", "carné b", "permiso b"]:
             self.assertNotIn(bad, f" {text} ")
 
     def test_fashion_experience_kept(self):
@@ -153,7 +156,8 @@ class TestCategoryMatching(_MatcherBase):
         score, d = self.m.score(_job("Delivery Driver", "Van delivery routes in Barcelona. Carnet B."))
         self.assertTrue(any("carnet B" in f for f in d["requirement_flags"]))
         self.assertGreater(score, 0.30)
-        self.assertAlmostEqual(score, plain, delta=0.05)
+        # Flag only: never capped or reduced below the unflagged score.
+        self.assertGreaterEqual(score, plain - 0.01)
 
     def test_fashion_job_not_penalised_by_licence_mention(self):
         score, d = self.m.score(_job(

@@ -69,6 +69,11 @@ def _strip_accents(text: str) -> str:
     return "".join(c for c in decomposed if not unicodedata.combining(c))
 
 
+# Location ending in the Spain country code, optionally after a region/province
+# code: "ES", "CT, ES", "Barcelona, CT, ES", "Lleida, L, ES".
+_SPAIN_LOCATION = re.compile(r"(?:^|,)\s*(?:[A-Z]{1,3}\s*,\s*)?ES\s*$")
+
+
 def normalize_for_match(text: str) -> str:
     """Lowercase + accent-fold, and drop Spanish gender suffixes ("Repartidor/a" → "repartidor")."""
     text = _strip_accents((text or "").lower())
@@ -257,12 +262,22 @@ class JobMatcher:
         return not any(r.search(title_norm) for r in cat["title_exclude"])
 
     @staticmethod
-    def _component_scores(title_tf, job_tf, job_text, profile_title_tfs, skill_tf, keywords):
+    def _component_scores(title_tf, job_tf, job_text, profile_title_tfs, skill_tf, keywords,
+                          containment=False):
         """Title / skill / specialty scores against one set of profile terms.
 
-        Title score is the best match against any of the given title vectors.
+        Title score is the best match against any of the given title vectors
+        (cosine). With containment (category titles), a job title holding every
+        word of a desired title ("Conductor VTC Cabify" ⊇ "conductor") is a full
+        match despite extra qualifiers; partial overlap scores the fraction of
+        the desired title's words present. Scope gates still decide which jobs
+        reach this point.
         """
         title_score = max((cosine_sim(title_tf, t) for t in profile_title_tfs), default=0.0)
+        if containment:
+            for t in profile_title_tfs:
+                if t:
+                    title_score = max(title_score, sum(1 for w in t if w in title_tf) / len(t))
         skill_score = cosine_sim(job_tf, skill_tf) if skill_tf else 0.0
         # Rescale: overlap is typically 0.0–0.15, map to 0–1
         skill_score = min(1.0, skill_score / 0.10)
@@ -348,7 +363,8 @@ class JobMatcher:
             best = None
             for cat in candidates:
                 scores = self._component_scores(
-                    title_tf, job_tf, job_text, cat["title_tfs"], cat["skill_tf"], cat["keywords"])
+                    title_tf, job_tf, job_text, cat["title_tfs"], cat["skill_tf"], cat["keywords"],
+                    containment=True)
                 key = (scores[0], scores[2], scores[1])
                 if best is None or key > best[0]:
                     best = (key, cat, scores)
@@ -448,6 +464,10 @@ class JobMatcher:
     def _location_score(self, job: Job) -> float:
         """Score location with strong boost for Remote + preferred regions/countries."""
         text = f"{job.location} {job.title} {job.description[:500]}".lower()
+        # Indeed writes Spanish locations as "City, <region/province code>, ES"
+        # (e.g. "Madrid, MD, ES", "Lleida, L, ES"): treat the ES country code as Spain.
+        if _SPAIN_LOCATION.search(job.location or ""):
+            text += " spain españa"
 
         # Remote preference
         if self.profile.get("remote_preferred") and any(k in text for k in ["remote", "work from home", "wfh"]):
