@@ -13,7 +13,9 @@ Modes:
 The browser flow handles plain HTML forms (Greenhouse/Lever-style). CAPTCHA,
 login walls, missing CV upload fields, unknown required questions and anything
 else it cannot complete truthfully stop as MANUAL_REQUIRED. It never tries to
-bypass CAPTCHA, anti-bot protection or authentication.
+bypass CAPTCHA, anti-bot protection or authentication. When run from a console,
+the browser is headed and a CAPTCHA pauses once for a person to solve it; the
+page is re-checked afterwards and is MANUAL_REQUIRED if the CAPTCHA remains.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
@@ -186,8 +189,29 @@ def _goto(page, url: str):
         pass
 
 
+def _human_present() -> bool:
+    """A person is at the console and can be asked to solve a CAPTCHA."""
+    try:
+        return bool(sys.stdin and sys.stdin.isatty())
+    except Exception:
+        return False
+
+
+def _wait_for_human(page, reason: str) -> bool:
+    """Block once until the person at the console presses Enter (no polling, no
+    retry loop). False when nobody confirmed; the caller re-checks the page."""
+    try:
+        input(f"\n{reason}\n  Page: {page.url}\n"
+              "  Solve the CAPTCHA in the open browser window, then press Enter to continue "
+              "(Ctrl+C to leave it for manual application): ")
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return True
+
+
 def fill_application_form(page, url: str, answers: Dict[str, str], cv_path: Path,
-                          mode: str = DRY_RUN, cv_sha256: str = "", job: Optional[Dict] = None) -> Dict:
+                          mode: str = DRY_RUN, cv_sha256: str = "", job: Optional[Dict] = None,
+                          wait_for_human: Optional[Callable] = None) -> Dict:
     """Drive one public application form on a Playwright-like `page`.
 
     Opens `url` (following at most two public "Apply" links to reach the form),
@@ -195,6 +219,10 @@ def fill_application_form(page, url: str, answers: Dict[str, str], cv_path: Path
     other vacancy, uploads the fixed CV, fills only fields that
     map to truthful profile answers and reports everything else. The final
     submit button is clicked only in LIVE mode, after re-checking the CV hash.
+
+    On a CAPTCHA, `wait_for_human(page, reason)` (when given) pauses once so a
+    person can solve it in the browser; the page is then re-checked and the flow
+    continues only if nothing blocks it any more. The CAPTCHA is never bypassed.
 
     Returns {"status", "reason", "filled", "missing_required", "evidence", "report"}.
     """
@@ -207,6 +235,11 @@ def fill_application_form(page, url: str, answers: Dict[str, str], cv_path: Path
     fields: List[Dict] = []
     for hop in range(3):
         blocked = _blocked_reason(page)
+        if blocked.startswith("CAPTCHA") and wait_for_human:
+            # Human solves it in the headed browser; same detection decides afterwards.
+            report["captcha_human_intervention"] = True
+            if wait_for_human(page, blocked):
+                blocked = _blocked_reason(page)
         if blocked:
             result["reason"] = blocked
             report["final_url"] = page.url
@@ -335,11 +368,11 @@ def verify_submission(page, before_html: str = "", before_url: str = "") -> Dict
     return {"status": SUBMISSION_FAILED, "reason": "Submit clicked but no confirmation observed", "evidence": ""}
 
 
-def _open_browser_page():
+def _open_browser_page(headless: bool = True):
     """Return (page, close_fn) using Playwright, or raise ImportError."""
     from playwright.sync_api import sync_playwright  # optional dependency
     pw = sync_playwright().start()
-    browser = pw.chromium.launch(headless=True)
+    browser = pw.chromium.launch(headless=headless)
     page = browser.new_page()
 
     def close():
@@ -387,15 +420,18 @@ def submit_application(app_id: int, profile: Dict, *, mode: Optional[str] = None
         if is_login_walled(route_url):
             return _record(app_id, db, mode, MANUAL_REQUIRED,
                            "Application route is a login-walled job board - not automated", report=report)
+        # Real browser + a person at the console: headed, so a CAPTCHA can be solved by hand.
+        human = page_factory is None and _human_present()
         try:
-            page, close = (page_factory() if page_factory else _open_browser_page())
+            page, close = (page_factory() if page_factory else _open_browser_page(headless=not human))
         except ImportError:
             return _record(app_id, db, mode, MANUAL_REQUIRED,
                            "Playwright not installed (pip install playwright; playwright install chromium)",
                            report=report)
         try:
             res = fill_application_form(page, route_url, answers, cv_path, mode=mode,
-                                        cv_sha256=app["cv_sha256"], job=app)
+                                        cv_sha256=app["cv_sha256"], job=app,
+                                        wait_for_human=_wait_for_human if human else None)
         except Exception as e:
             res = {"status": MANUAL_REQUIRED, "reason": f"Browser automation stopped: {e}", "evidence": ""}
         finally:

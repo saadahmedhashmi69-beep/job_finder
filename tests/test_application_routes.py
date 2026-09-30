@@ -264,6 +264,53 @@ class TestPublicForms(RouteBase):
         self.assertIn("CAPTCHA", res["reason"])
         self.assertEqual(site.uploads, [])
 
+    CAPTCHA_URL = "https://job-boards.greenhouse.io/reparto/jobs/c"
+    CAPTCHA_HTML = '<div class="h-captcha" data-sitekey="x"></div>'
+
+    def fill_with_human(self, site, human, mode=submitter.DRY_RUN):
+        return submitter.fill_application_form(
+            site, self.CAPTCHA_URL, {"first_name": "A", "last_name": "B", "email": "a@b.es"}, FIXED_CV,
+            mode=mode, wait_for_human=human)
+
+    def test_captcha_remaining_after_human_intervention_is_manual(self):
+        for confirmed in (True, False):  # pressed Enter without solving / declined
+            with self.subTest(confirmed=confirmed):
+                site = FakeSite({self.CAPTCHA_URL: {"html": self.CAPTCHA_HTML, "fields": APPLY_FORM}})
+                human = mock.Mock(return_value=confirmed)
+                res = self.fill_with_human(site, human, mode=submitter.LIVE)
+                human.assert_called_once()  # one pause, no retry loop
+                self.assertEqual(res["status"], MANUAL_REQUIRED)
+                self.assertIn("CAPTCHA", res["reason"])
+                self.assertEqual((site.uploads, site.filled, site.clicked), ([], {}, False))
+
+    def test_captcha_cleared_by_human_resumes_flow(self):
+        site = FakeSite({self.CAPTCHA_URL: {"html": self.CAPTCHA_HTML, "fields": APPLY_FORM}},
+                        after_html="<h1>Thank you for applying!</h1>")
+
+        def human(page, reason):
+            self.assertIn("CAPTCHA", reason)
+            page._html = "<form></form>"  # the person solved it in the browser
+            return True
+
+        res = self.fill_with_human(site, human)
+        self.assertEqual(res["status"], submitter.DRY_RUN_VALIDATED, res)
+        self.assertEqual(site.uploads, [str(FIXED_CV)])
+        self.assertTrue(res["report"]["captcha_human_intervention"])
+        self.assertFalse(site.clicked)  # DRY_RUN still never submits
+
+        site.goto(self.CAPTCHA_URL)  # LIVE: resumes, submits, and still needs confirmation
+        res = self.fill_with_human(site, human, mode=submitter.LIVE)
+        self.assertTrue(site.clicked)
+        self.assertEqual(res["status"], SUBMITTED, res)
+
+    def test_login_wall_never_waits_for_human(self):
+        site = FakeSite({self.CAPTCHA_URL: {"html": "<p>Sign in to apply for this job</p>", "fields": APPLY_FORM}})
+        human = mock.Mock(return_value=True)
+        res = self.fill_with_human(site, human)
+        human.assert_not_called()
+        self.assertEqual(res["status"], MANUAL_REQUIRED)
+        self.assertIn("Login required", res["reason"])
+
     def test_unknown_required_fields_are_manual_and_left_empty(self):
         unknown = [fld("salary_expectation", required=True, label="Salary expectation"),
                    fld("years", "number", required=True, label="Years of driving experience"),
