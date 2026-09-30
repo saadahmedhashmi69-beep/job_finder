@@ -7,3 +7,4 @@ python-dotenv>=1.0
 sentence-transformers>=2.2
 python-jobspy>=0.1.0
 ddgs>=0.1
+playwright>=1.40  # optional: browser form submission (then: playwright install chromium)

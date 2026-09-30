@@ -335,8 +335,20 @@ def create_app():
 
     @app.route("/applications")
     def applications_page():
-        apps = get_applications(limit=100)
-        return render_template("applications.html", applications=apps)
+        from qualification import APPLICATION_STATES, NEEDS_REVIEW, REJECTED
+        from storage import get_jobs_by_qualification
+        all_apps = get_applications(limit=300)
+        # Only qualification-gated applications; legacy pre-gate rows are hidden.
+        apps = [a for a in all_apps if a.get("status") in APPLICATION_STATES]
+        for a in apps + (review := get_jobs_by_qualification([NEEDS_REVIEW, REJECTED], limit=100)):
+            try:
+                a["qual_reasons"] = json.loads(a.get("qualification_reasons") or "[]")
+            except (TypeError, ValueError):
+                a["qual_reasons"] = []
+        from submitter import get_submission_mode
+        return render_template("applications.html", applications=apps, review_jobs=review,
+                               legacy_hidden=len(all_apps) - len(apps),
+                               submission_mode=get_submission_mode(load_profile()))
 
     @app.route("/pipeline")
     def pipeline_page():
@@ -375,55 +387,28 @@ def create_app():
             return jsonify({"status": "error", "error": "Job not found"})
 
         job = dict(row)
+        # Hard qualification gate: only QUALIFIED jobs get an application.
+        # Synchronous — no LLM or CV generation involved (fixed CV only).
+        from application_prep import prepare_application
+        try:
+            result = prepare_application(job, load_profile())
+        except Exception as e:
+            logger.error("Application preparation failed: %s", e)
+            return jsonify({"status": "error", "error": str(e)})
+        if not result["app_id"]:
+            return jsonify({"status": "error", "error": f"{result['status']}: " + "; ".join(result["reasons"])})
+        return jsonify({"status": "ok", "app_status": result["status"],
+                        "message": f"{result['status']} ({result['method']}): " + "; ".join(result["reasons"])})
 
-        def generate():
-            try:
-                from cv_customizer import analyze_job, LIFE_STORY_PATH
-                from fixed_cv import prepare_fixed_cv_application
-                from cover_letter import create_cover_letter
-                from form_answers import generate_form_answers as gen_answers
-                from storage import create_application, update_application
-
-                profile = load_profile()
-                model = profile.get("pipeline", {}).get("ollama_model", "qwen3.5:9b")
-
-                # Fixed CV — never customized per job
-                result = prepare_fixed_cv_application(
-                    job_url=job["url"], title=job["title"],
-                    company=job["company"], location=job.get("location", ""),
-                    description=job.get("description", ""), profile=profile,
-                )
-
-                app_id = create_application(job["url"], result["slug"])
-                update_application(app_id, status="cv_generated", cv_pdf_path=result["cv_pdf_path"])
-
-                life_story = LIFE_STORY_PATH.read_text(encoding="utf-8") if LIFE_STORY_PATH.exists() else ""
-                job_analysis = analyze_job(job.get("description", ""), job["title"], job["company"], model=model)
-
-                cl_path = create_cover_letter(
-                    app_dir=result["app_dir"], title=job["title"],
-                    company=job["company"], location=job.get("location", ""),
-                    description=job.get("description", ""),
-                    life_story=life_story, job_analysis=job_analysis, model=model,
-                )
-                if cl_path:
-                    update_application(app_id, status="letter_generated", cover_letter_pdf_path=cl_path)
-
-                answers = gen_answers(
-                    life_story=life_story, title=job["title"],
-                    company=job["company"], description=job.get("description", ""),
-                    job_analysis=job_analysis, model=model,
-                )
-                if answers:
-                    update_application(app_id, status="ready", form_answers_json=json.dumps(answers))
-
-                logger.info("Application generated for %s at %s", job["title"], job["company"])
-            except Exception as e:
-                logger.error("Application generation failed: %s", e)
-
-        thread = threading.Thread(target=generate)
-        thread.start()
-        return jsonify({"status": "ok", "message": "Generating application in background..."})
+    @app.route("/api/application/submit", methods=["POST"])
+    def api_submit_application():
+        """Run the web/email submission route. DRY_RUN unless LIVE is enabled in profile.yaml."""
+        from submitter import submit_application
+        data = request.json or {}
+        if not data.get("app_id"):
+            return jsonify({"status": "error", "error": "app_id required"}), 400
+        result = submit_application(int(data["app_id"]), load_profile())
+        return jsonify({"status": "ok", "result": result})
 
     @app.route("/api/application/set-recruiter", methods=["POST"])
     def api_set_recruiter():
@@ -467,6 +452,14 @@ def create_app():
             return jsonify({"status": "error", "error": "Application not found"}), 404
 
         app_row = dict(row)
+        if not dry_run:
+            from submitter import get_submission_mode, LIVE
+            if get_submission_mode(load_profile()) != LIVE:
+                return jsonify({"status": "error", "error": "LIVE sending is disabled (DRY_RUN is the default). "
+                                "Set pipeline.submission_mode: LIVE and allow_live_submission: true."}), 400
+            if app_row.get("status") != "READY_TO_SUBMIT" or app_row.get("submitted_at") or app_row.get("sent_at"):
+                return jsonify({"status": "error", "error": f"Not sendable (status {app_row.get('status')}); "
+                                "only qualified READY_TO_SUBMIT applications, never twice."}), 400
         to_email = recruiter_email or (app_row.get("recruiter_email") or "").strip()
         # For dry_run (review email), recruiter email is optional.
         if not dry_run and not to_email:
@@ -532,7 +525,6 @@ def create_app():
             int(app_id),
             recruiter_email=to_email,
             approved_at=_dt.now().isoformat(),
-            status="approved",
             email_subject=subject,
             email_body=body,
         )
@@ -546,7 +538,9 @@ def create_app():
         )
 
         if ok:
-            update_application(int(app_id), status="sent", sent_at=_dt.now().isoformat())
+            update_application(int(app_id), status="SUBMITTED", submission_status="SUBMITTED",
+                               submission_mode="LIVE", status_reason=f"Email accepted by SMTP for {to_email}",
+                               sent_at=_dt.now().isoformat(), submitted_at=_dt.now().isoformat())
             return jsonify({"status": "ok", "sent": True})
         return jsonify({"status": "error", "error": "Failed to send email"}), 500
 

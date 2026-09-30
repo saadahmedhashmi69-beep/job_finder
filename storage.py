@@ -61,6 +61,24 @@ def get_db(db_path: Path = DB_PATH) -> sqlite3.Connection:
             "email_body": "TEXT DEFAULT ''",
             "approved_at": "TEXT DEFAULT ''",
             "sent_at": "TEXT DEFAULT ''",
+            # Qualification-gated application workflow (see qualification.py).
+            "application_method": "TEXT DEFAULT ''",
+            "submission_status": "TEXT DEFAULT ''",
+            "submission_mode": "TEXT DEFAULT ''",
+            "status_reason": "TEXT DEFAULT ''",
+            "cv_sha256": "TEXT DEFAULT ''",
+            "submitted_at": "TEXT DEFAULT ''",
+            "submission_evidence": "TEXT DEFAULT ''",
+        },
+    )
+    _ensure_columns(
+        conn,
+        "jobs",
+        {
+            "qualification_status": "TEXT DEFAULT ''",
+            "qualification_category": "TEXT DEFAULT ''",
+            "qualification_reasons": "TEXT DEFAULT '[]'",
+            "qualified_at": "TEXT DEFAULT ''",
         },
     )
     if _ensure_columns(conn, "jobs", {"is_remote": "INTEGER DEFAULT 0"}):
@@ -165,14 +183,16 @@ def get_applications(
     conn = get_db(db_path)
     if status:
         rows = conn.execute(
-            """SELECT a.*, j.title, j.company, j.location, j.match_score, j.board
+            """SELECT a.*, j.title, j.company, j.location, j.match_score, j.board,
+                      j.qualification_status, j.qualification_reasons
                FROM applications a JOIN jobs j ON a.job_url = j.url
                WHERE a.status = ? ORDER BY a.created_at DESC LIMIT ?""",
             (status, limit),
         ).fetchall()
     else:
         rows = conn.execute(
-            """SELECT a.*, j.title, j.company, j.location, j.match_score, j.board
+            """SELECT a.*, j.title, j.company, j.location, j.match_score, j.board,
+                      j.qualification_status, j.qualification_reasons
                FROM applications a JOIN jobs j ON a.job_url = j.url
                ORDER BY a.created_at DESC LIMIT ?""",
             (limit,),
@@ -189,6 +209,48 @@ def get_application_by_job(job_url: str, db_path: Path = DB_PATH) -> Optional[Di
     ).fetchone()
     conn.close()
     return dict(row) if row else None
+
+
+def find_existing_application(job_url: str, title: str = "", company: str = "",
+                              db_path: Path = DB_PATH) -> Optional[Dict]:
+    """Duplicate protection: an application for the same URL, or for the same
+    normalized title|company (the scrape-time dedup fingerprint)."""
+    app = get_application_by_job(job_url, db_path=db_path)
+    if app or not (title and company):
+        return app
+    conn = get_db(db_path)
+    row = conn.execute(
+        """SELECT a.* FROM applications a JOIN jobs j ON a.job_url = j.url
+           WHERE LOWER(TRIM(j.title)) = ? AND LOWER(TRIM(j.company)) = ? LIMIT 1""",
+        (title.lower().strip(), company.lower().strip()),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def set_job_qualification(job_url: str, status: str, category: str = "",
+                          reasons: Optional[List[str]] = None, db_path: Path = DB_PATH):
+    conn = get_db(db_path)
+    conn.execute(
+        """UPDATE jobs SET qualification_status = ?, qualification_category = ?,
+           qualification_reasons = ?, qualified_at = ? WHERE url = ?""",
+        (status, category, json.dumps(reasons or []), datetime.now().isoformat(), job_url),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_jobs_by_qualification(statuses: List[str], limit: int = 100,
+                              db_path: Path = DB_PATH) -> List[Dict]:
+    conn = get_db(db_path)
+    marks = ",".join("?" for _ in statuses)
+    rows = conn.execute(
+        f"""SELECT * FROM jobs WHERE qualification_status IN ({marks}) AND hidden = 0
+            ORDER BY match_score DESC LIMIT ?""",
+        (*statuses, limit),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 # --- Pipeline Run Logging ---

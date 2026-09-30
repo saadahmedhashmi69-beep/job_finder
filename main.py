@@ -312,6 +312,34 @@ def cmd_pipeline(args):
     print(f"\nPipeline complete: {stats}")
 
 
+def cmd_prepare(args):
+    """Qualify stored matched jobs and prepare applications (no scraping, no sending)."""
+    from matcher import JobMatcher
+    from application_prep import prepare_application
+    from storage import get_top_jobs
+    profile = load_profile()
+    threshold = profile.get("pipeline", {}).get("auto_apply_threshold", 0.5)
+    matcher = JobMatcher(profile)
+    jobs = [j for j in get_top_jobs(limit=args.limit, min_score=threshold) if j.get("description")]
+    for job in jobs:
+        r = prepare_application(job, profile, matcher=matcher)
+        print(f"{r['status']:<18} app={r['app_id'] or '-':<5} {job['match_score']:.2f}  "
+              f"{job['title'][:45]} | {job['company'][:25]}  {'; '.join(r['reasons'])}")
+
+
+def cmd_submit(args):
+    """Submit READY_TO_SUBMIT applications (DRY_RUN unless LIVE is enabled in profile.yaml)."""
+    from storage import get_applications
+    from submitter import submit_application, get_submission_mode
+    profile = load_profile()
+    print(f"Submission mode: {get_submission_mode(profile)}")
+    ids = [args.app_id] if args.app_id else [
+        a["id"] for a in get_applications(status="READY_TO_SUBMIT", limit=args.limit)]
+    for app_id in ids:
+        r = submit_application(int(app_id), profile)
+        print(f"app {app_id}: {r['status']} - {r['reason']}")
+
+
 def cmd_daemon(args):
     """Start the background automation daemon."""
     from pipeline import run_daemon
@@ -592,6 +620,15 @@ def main():
     p_custom = subparsers.add_parser("customize", help="Generate custom CV for a job")
     p_custom.add_argument("--url", required=True, help="Job URL from database")
     p_custom.set_defaults(func=cmd_customize)
+
+    # prepare / submit
+    p_prep = subparsers.add_parser("prepare", help="Qualify matched jobs + prepare applications (no scrape/send)")
+    p_prep.add_argument("--limit", type=int, default=50)
+    p_prep.set_defaults(func=cmd_prepare)
+    p_sub = subparsers.add_parser("submit", help="Submit READY_TO_SUBMIT applications (DRY_RUN by default)")
+    p_sub.add_argument("--app-id", type=int, default=None)
+    p_sub.add_argument("--limit", type=int, default=5)
+    p_sub.set_defaults(func=cmd_submit)
 
     # answers
     p_answers = subparsers.add_parser("answers", help="Show form answers for a job")

@@ -1,6 +1,8 @@
 """Pipeline orchestrator — background daemon for automated job application.
 
-Runs the full loop: scrape → match → fixed CV → cover letter → form answers → email.
+Runs: scrape → dedupe → match → hard qualification → application preparation
+(fixed CV, truthful cover letter + form answers) → READY_TO_SUBMIT / MANUAL_REQUIRED.
+Submission is a separate step (submitter.py, DRY_RUN by default).
 The CV attachment is always the fixed PDF from pipeline.fixed_cv_path (see fixed_cv.py).
 Can run as a one-shot or as a daemon on a 2-day interval.
 """
@@ -23,15 +25,12 @@ from models import Job, JobBoard, SearchQuery
 from scrapers import SCRAPERS
 from matcher import JobMatcher
 from storage import (
-    save_jobs, get_db, get_top_jobs,
-    create_application, update_application, get_application_by_job,
+    save_jobs, get_db, get_top_jobs, find_existing_application,
     start_pipeline_run, finish_pipeline_run,
     get_new_jobs_since, get_last_email_sent,
 )
-from cv_customizer import LIFE_STORY_PATH
-from fixed_cv import prepare_fixed_cv_application, resolve_fixed_cv_path
-from cover_letter import create_cover_letter
-from form_answers import generate_form_answers
+from fixed_cv import resolve_fixed_cv_path
+from application_prep import prepare_application
 from notifier import send_digest_email, should_send_digest
 
 logger = logging.getLogger(__name__)
@@ -166,113 +165,52 @@ def run_pipeline(
         else:
             logger.info("[DRY RUN] Would scrape jobs")
 
-        # --- Step 2: Get top matches for application ---
-        logger.info("=== Pipeline Step 2: Selecting top matches ===")
-        top_jobs = get_top_jobs(limit=max_applications * 2, min_score=threshold)
+        # --- Step 2: MATCHED jobs (score only ranks; it never qualifies) ---
+        logger.info("=== Pipeline Step 2: Selecting matched jobs ===")
+        top_jobs = get_top_jobs(limit=max_applications * 5, min_score=threshold)
         candidates = []
         for job in top_jobs:
-            existing = get_application_by_job(job["url"])
-            if not existing and job.get("description"):
+            # Duplicate protection: skip jobs that already have an application.
+            if find_existing_application(job["url"], job.get("title", ""), job.get("company", "")):
+                continue
+            if job.get("description"):
                 candidates.append(job)
-            if len(candidates) >= max_applications:
-                break
         stats["jobs_matched"] = len(candidates)
-        logger.info("Found %d jobs to process (score >= %.2f)", len(candidates), threshold)
+        logger.info("Found %d matched jobs (score >= %.2f) to qualify", len(candidates), threshold)
 
-        # --- Step 3: Generate applications ---
-        logger.info("=== Pipeline Step 3: Generating applications ===")
+        # --- Step 3: Hard qualification -> application preparation ---
+        # Only QUALIFIED jobs get an application (fixed CV, letter, answers).
+        logger.info("=== Pipeline Step 3: Qualification + application preparation ===")
         # Fail clearly up front if the fixed CV is missing.
         fixed_cv = resolve_fixed_cv_path(profile)
         logger.info("Using fixed CV for all applications: %s", fixed_cv)
-        life_story = ""
-        if LIFE_STORY_PATH.exists():
-            life_story = LIFE_STORY_PATH.read_text(encoding="utf-8")
+        matcher = JobMatcher(profile)
+        qual_counts = {}
 
         for i, job in enumerate(candidates):
             if _shutdown:
                 logger.info("Shutdown requested, stopping pipeline")
                 break
-
-            logger.info(
-                "Processing %d/%d: %s at %s (score: %.2f)",
-                i + 1, len(candidates),
-                job["title"], job["company"], job["match_score"],
-            )
-
+            if stats["applications_created"] >= max_applications:
+                break
             if dry_run:
-                logger.info("[DRY RUN] Would generate application")
+                logger.info("[DRY RUN] Would qualify %s at %s", job["title"], job["company"])
                 continue
-
             try:
-                # Fixed CV — never customized per job
-                cv_result = prepare_fixed_cv_application(
-                    job_url=job["url"],
-                    title=job["title"],
-                    company=job["company"],
-                    location=job.get("location", ""),
-                    description=job.get("description", ""),
-                    profile=profile,
-                )
-
-                # Create application record
-                app_id = create_application(job["url"], cv_result["slug"])
-                update_application(
-                    app_id,
-                    status="cv_generated",
-                    cv_pdf_path=cv_result["cv_pdf_path"],
-                )
-
-                # Generate cover letter
-                from cv_customizer import analyze_job
-                job_analysis = analyze_job(
-                    job.get("description", ""),
-                    job["title"],
-                    job["company"],
-                    model=model,
-                )
-
-                cl_path = create_cover_letter(
-                    app_dir=cv_result["app_dir"],
-                    title=job["title"],
-                    company=job["company"],
-                    location=job.get("location", ""),
-                    description=job.get("description", ""),
-                    life_story=life_story,
-                    job_analysis=job_analysis,
-                    model=model,
-                )
-
-                if cl_path:
-                    update_application(
-                        app_id,
-                        status="letter_generated",
-                        cover_letter_pdf_path=cl_path,
-                    )
-
-                # Generate form answers
-                answers = generate_form_answers(
-                    life_story=life_story,
-                    title=job["title"],
-                    company=job["company"],
-                    description=job.get("description", ""),
-                    job_analysis=job_analysis,
-                    model=model,
-                )
-
-                if answers:
-                    update_application(
-                        app_id,
-                        status="ready",
-                        form_answers_json=json.dumps(answers),
-                    )
-
-                stats["applications_created"] += 1
-                log_lines.append(f"OK: {job['title']} at {job['company']}")
-                logger.info("Application ready: %s", cv_result["slug"])
-
+                result = prepare_application(job, profile, matcher=matcher)
+                qual_counts[result["status"]] = qual_counts.get(result["status"], 0) + 1
+                if result["app_id"] and result["status"] != "DUPLICATE":
+                    stats["applications_created"] += 1
+                    log_lines.append(f"{result['status']}: {job['title']} at {job['company']}")
+                else:
+                    log_lines.append(f"{result['status']}: {job['title']} at {job['company']} "
+                                     f"({'; '.join(result['reasons'])})")
             except Exception as e:
                 logger.error("Failed to process job: %s", e)
                 log_lines.append(f"ERROR: {job['title']} at {job['company']}: {e}")
+
+        if qual_counts:
+            log_lines.append(f"Qualification/application outcomes: {qual_counts}")
 
         # --- Step 4: Send email digest ---
         logger.info("=== Pipeline Step 4: Email digest ===")

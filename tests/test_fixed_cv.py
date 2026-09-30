@@ -15,11 +15,19 @@ from unittest import mock
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+import application_prep  # noqa: E402
 import applier  # noqa: E402
 import cv_customizer  # noqa: E402
 import fixed_cv  # noqa: E402
 import pipeline  # noqa: E402
 import storage  # noqa: E402
+from qualification import QualificationResult, QUALIFIED  # noqa: E402
+
+
+def _qualified(job, profile, matcher=None):
+    # The hard gate itself is covered in test_application_workflow.py.
+    cat = "fashion" if "design" in job["title"].lower() else "driver"
+    return QualificationResult(QUALIFIED, cat)
 
 FIXED_CV = (PROJECT_ROOT / "cv" / "Raheel Tahir Resume Updated.pdf").resolve()
 
@@ -71,6 +79,9 @@ class FixedCVTestBase(unittest.TestCase):
                 "auto_apply_threshold": 0.5,
                 "max_applications_per_run": 10,
                 "email_recipient": "",
+                # Enabled only so mocked approve-send tests can reach the sender.
+                "submission_mode": "LIVE",
+                "allow_live_submission": True,
             }
         }
         # Never let any code path reach real SMTP.
@@ -98,11 +109,11 @@ class TestPipelineUsesFixedCV(FixedCVTestBase):
         created = {}
         updates = []
 
-        def fake_create_application(job_url, slug):
+        def fake_create_application(job_url, slug, db_path=None):
             created[job_url] = len(created) + 1
             return created[job_url]
 
-        def fake_update_application(app_id, **kwargs):
+        def fake_update_application(app_id, db_path=None, **kwargs):
             updates.append((app_id, kwargs))
 
         patches = [
@@ -110,14 +121,15 @@ class TestPipelineUsesFixedCV(FixedCVTestBase):
             mock.patch.object(pipeline, "JobMatcher"),
             mock.patch.object(pipeline, "save_jobs", return_value=0),
             mock.patch.object(pipeline, "get_top_jobs", return_value=jobs),
-            mock.patch.object(pipeline, "get_application_by_job", return_value=None),
-            mock.patch.object(pipeline, "create_application", side_effect=fake_create_application),
-            mock.patch.object(pipeline, "update_application", side_effect=fake_update_application),
+            mock.patch.object(pipeline, "find_existing_application", return_value=None),
+            mock.patch.object(storage, "find_existing_application", return_value=None),
+            mock.patch.object(storage, "set_job_qualification"),
+            mock.patch.object(application_prep, "qualify_job", side_effect=_qualified),
+            mock.patch.object(storage, "create_application", side_effect=fake_create_application),
+            mock.patch.object(storage, "update_application", side_effect=fake_update_application),
             mock.patch.object(pipeline, "start_pipeline_run", return_value=1),
             mock.patch.object(pipeline, "finish_pipeline_run"),
             mock.patch.object(pipeline, "should_send_digest", return_value=False),
-            mock.patch.object(pipeline, "create_cover_letter", return_value=None),
-            mock.patch.object(pipeline, "generate_form_answers", return_value={"Why us?": "Because."}),
             mock.patch.object(cv_customizer, "analyze_job", return_value={}),
             mock.patch.object(cv_customizer, "customize_cv_for_job", side_effect=_forbid_customize),
             mock.patch.object(cv_customizer, "compile_latex", side_effect=_forbid_customize),
@@ -197,7 +209,7 @@ class TestAppFlows(FixedCVTestBase):
         slug = cv_customizer._slugify(f"{job['company']}-{job['title']}")
         cur = conn.execute(
             "INSERT INTO applications (job_url, slug, status, cv_pdf_path, cover_letter_pdf_path, "
-            "recruiter_email) VALUES (?, ?, 'ready', ?, ?, 'hr@example.com')",
+            "recruiter_email) VALUES (?, ?, 'READY_TO_SUBMIT', ?, ?, 'hr@example.com')",
             (job["url"], slug, cv_pdf_path, cover_letter_pdf_path),
         )
         conn.commit()
@@ -218,6 +230,9 @@ class TestAppFlows(FixedCVTestBase):
         patches = [
             mock.patch.object(self.app_module.threading, "Thread", SyncThread),
             mock.patch.object(storage, "create_application", return_value=42),
+            mock.patch.object(storage, "find_existing_application", return_value=None),
+            mock.patch.object(storage, "set_job_qualification"),
+            mock.patch.object(application_prep, "qualify_job", side_effect=_qualified),
             mock.patch.object(storage, "update_application",
                               side_effect=lambda app_id, **kw: calls.append(kw)),
             mock.patch.object(cv_customizer, "analyze_job", return_value={}),

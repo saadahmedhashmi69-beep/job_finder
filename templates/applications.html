@@ -1,6 +1,93 @@
 {% extends "base.html" %}
 {% block title %}Applications — AI Apply{% endblock %}
 {% block content %}
+<h2>Applications</h2>
+<p style="color:#6b7280">Only jobs that passed the hard qualification gate get an application
+(fixed CV + truthful cover letter + form answers). A match score alone never qualifies a job.
+Submission mode: <strong>{{ submission_mode }}</strong>{% if submission_mode == 'DRY_RUN' %} — forms are filled and validated but never submitted; no email is sent{% endif %}.
+{% if legacy_hidden %}<br><small>{{ legacy_hidden }} legacy record(s) created before the qualification gate are hidden.</small>{% endif %}</p>
+
+{% if applications %}
+<table role="grid">
+    <thead>
+        <tr>
+            <th>Role</th>
+            <th>Company</th>
+            <th>Match score</th>
+            <th>Qualification</th>
+            <th>Application status</th>
+            <th>Method</th>
+            <th>Submission</th>
+            <th>Recruiter Email</th>
+            <th>CV</th>
+            <th>Actions</th>
+            <th>Created</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for app in applications %}
+        <tr>
+            <td><a href="/job?url={{ app.job_url | urlencode }}">{{ app.title or 'N/A' }}</a></td>
+            <td>{{ app.company or 'N/A' }}</td>
+            <td>{{ "%.0f"|format((app.match_score or 0) * 100) }}%</td>
+            <td>{{ app.qualification_status or '—' }}</td>
+            <td>
+                <span style="font-weight:600;
+                    color:{% if app.status == 'SUBMITTED' %}#16a34a{% elif app.status == 'READY_TO_SUBMIT' %}#2563eb{% elif app.status in ['MANUAL_REQUIRED','SUBMISSION_FAILED'] %}#dc2626{% else %}#d97706{% endif %}">
+                    {{ app.status }}
+                </span>
+                {% if app.status_reason %}<br><small style="color:#6b7280">{{ app.status_reason }}</small>{% endif %}
+            </td>
+            <td>{{ app.application_method or '—' }}</td>
+            <td>{{ app.submission_status or 'not attempted' }}{% if app.submission_mode %} <small>({{ app.submission_mode }})</small>{% endif %}
+                {% if app.submission_evidence %}<br><small>{{ app.submission_evidence }}</small>{% endif %}</td>
+            <td style="min-width:200px">
+                <input type="email" id="recruiter-email-{{ app.id }}" placeholder="only if published in the posting"
+                       value="{{ app.recruiter_email or '' }}"
+                       onblur="setRecruiterEmail({{ app.id }}, this.value)" style="margin-bottom:0">
+            </td>
+            <td>
+                {% if app.cv_pdf_path %}
+                <a href="/download?path={{ app.cv_pdf_path }}" target="_blank">Fixed CV</a>
+                {% else %}—{% endif %}
+            </td>
+            <td style="min-width:180px">
+                <div class="btn-group">
+                    <button class="btn-sm outline" onclick="submitApp({{ app.id }})"
+                            {% if app.status != 'READY_TO_SUBMIT' %}disabled{% endif %}>
+                        {% if submission_mode == 'LIVE' %}Submit (LIVE){% else %}Dry-run fill{% endif %}
+                    </button>
+                    <button class="btn-sm outline" onclick="approveSend({{ app.id }}, true)">Email me for review</button>
+                </div>
+            </td>
+            <td>{{ app.created_at[:10] if app.created_at else 'N/A' }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<p>No qualified applications yet.</p>
+{% endif %}
+
+{% if review_jobs %}
+<h3>Not qualified (needs review / rejected)</h3>
+<table role="grid">
+    <thead><tr><th>Role</th><th>Company</th><th>Match score</th><th>Qualification</th><th>Reasons / flags</th></tr></thead>
+    <tbody>
+        {% for j in review_jobs %}
+        <tr>
+            <td><a href="/job?url={{ j.url | urlencode }}">{{ j.title }}</a></td>
+            <td>{{ j.company }}</td>
+            <td>{{ "%.0f"|format((j.match_score or 0) * 100) }}%</td>
+            <td style="font-weight:600;color:{% if j.qualification_status == 'REJECTED' %}#dc2626{% else %}#d97706{% endif %}">{{ j.qualification_status }}</td>
+            <td><small>{{ j.qual_reasons | join('; ') }}</small></td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}
+{% endblock %}
+{% block content %}
 <h2>Generated Applications</h2>
 <p style="color:#6b7280">Auto-generated CVs, cover letters, and form answers for matched jobs.</p>
 
@@ -84,10 +171,20 @@ async function setRecruiterEmail(appId, email) {
     }
 }
 
+async function submitApp(appId) {
+    const resp = await fetch('/api/application/submit', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({app_id: appId}),
+    });
+    const data = await resp.json();
+    alert(data.status === 'ok' ? `${data.result.status}: ${data.result.reason}` : 'Error: ' + data.error);
+    window.location.reload();
+}
+
 async function approveSend(appId, dryRun) {
     const recruiterEmail = (document.getElementById(`recruiter-email-${appId}`)?.value || '').trim();
-    if (!recruiterEmail) {
-        alert('Please enter recruiter email first.');
+    if (!dryRun && !recruiterEmail) {
+        alert('No recruiter email: use the web/ATS route instead.');
         return;
     }
     const btn = event.target;
