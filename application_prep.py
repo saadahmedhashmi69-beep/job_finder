@@ -60,6 +60,7 @@ JOB_BOARD_HOSTS = LOGIN_WALLED_HOSTS + (
     "careerjet.", "trovit.", "jobatus.", "facebook.com", "twitter.com", "x.com", "instagram.com",
 )
 EMPLOYER = "employer"  # direct employer application page (non-ATS)
+_NO_EMPLOYER = ("", "unknown", "confidential", "confidencial", "n/a")  # company placeholders
 
 _EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 _BAD_EMAIL = re.compile(r"(no-?reply|donotreply|@sentry|\.png$|\.jpg$)", re.I)
@@ -118,10 +119,16 @@ def _category_skills(profile: Dict, category: str) -> List[str]:
     return []
 
 
+def _company_label(job: Dict) -> str:
+    """Employer name for letters; a placeholder such as "Unknown" is never written as a name."""
+    company = (job.get("company") or "").strip()
+    return "your company" if company.lower() in _NO_EMPLOYER else company
+
+
 def generate_cover_letter(job: Dict, profile: Dict, category: str) -> str:
     """Job-specific, truthful cover letter built only from profile facts."""
     f = candidate_facts(profile)
-    title, company = job.get("title") or "the advertised", job.get("company") or "your company"
+    title, company = job.get("title") or "the advertised", _company_label(job)
     skills = _category_skills(profile, category)
     lines = [f"Dear Hiring Team at {company},", "",
              f"I am writing to apply for the {title} position"
@@ -154,7 +161,7 @@ def generate_form_answers(job: Dict, profile: Dict, category: str, cover_letter:
                                  "phone", "location", "city", "country", "linkedin") if f[k]}
     answers["cover_letter"] = cover_letter
     answers["why_interested"] = (
-        f"I am applying for the {job.get('title', 'role')} role at {job.get('company', 'your company')} "
+        f"I am applying for the {job.get('title', 'role')} role at {_company_label(job)} "
         + ("because it is a womenswear design role, which matches my fashion design background."
            if category == "fashion" else "because it is a driving role that matches my CV.")
     )
@@ -341,15 +348,28 @@ def detect_application_method(job: Dict, recruiter_email: str = "", fetch: Optio
     reason = ("No public application route: the job-board posting (LinkedIn/Indeed/...) exposes no "
               "employer/ATS application URL and no application email" if _host(url)
               else "No application URL or email")
+    employer = ""
     if fetch and search:
         # Last resort: the same vacancy on the employer's own site / a public ATS.
         from employer_routes import discover_employer_route
         found = discover_employer_route(job, search=search, fetch=fetch)
         if found["url"]:
             return {"method": WEB, "ats": found["route_type"], "email": "", **found}
-        reason = f"{reason}. {found['reason']}"
+        reason, employer = f"{reason}. {found['reason']}", found["employer"]
     return {"method": MANUAL_REQUIRED, "ats": "", "route_type": "", "url": "", "source": "", "email": "",
-            "reason": reason}
+            "employer": employer, "reason": reason}
+
+
+def _save_resolved_employer(job_url: str, employer: str, db: Path) -> None:
+    """Record an employer verified from the public posting. Only a placeholder
+    ("Unknown"/empty) is replaced; title, URL, board and ids are untouched."""
+    if not employer:
+        return
+    conn = storage.get_db(db)
+    conn.execute(f"UPDATE jobs SET company = ? WHERE url = ? AND LOWER(TRIM(COALESCE(company, ''))) "
+                 f"IN ({','.join('?' for _ in _NO_EMPLOYER)})", (employer, job_url, *_NO_EMPLOYER))
+    conn.commit()
+    conn.close()
 
 
 # --- Preparation -------------------------------------------------------------
@@ -404,6 +424,7 @@ def prepare_application(job: Dict, profile: Dict, *, matcher=None,
     )
 
     method = detect_application_method(job, fetch=fetch or _http_fetch, search=search or _web_search)
+    _save_resolved_employer(job["url"], method.get("employer", ""), db)
     status = MANUAL_REQUIRED if method["method"] == MANUAL_REQUIRED else READY_TO_SUBMIT
     storage.update_application(
         app_id, db_path=db, status=status, application_method=method["method"],
@@ -444,6 +465,7 @@ def reroute_application(app: Dict, job: Dict, *, profile: Optional[Dict] = None,
     app_id = app["id"]
     job = dict(job, apply_url=job.get("apply_url") or app.get("application_url") or "")
     method = detect_application_method(job, fetch=fetch or _http_fetch, search=search or _web_search)
+    _save_resolved_employer(app["job_url"], method.get("employer", ""), db)
     if method["method"] == MANUAL_REQUIRED:
         reason = f"Route re-check: {method['reason']}"
         storage.update_application(app_id, db_path=db, status_reason=reason)

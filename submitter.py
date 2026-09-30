@@ -59,6 +59,10 @@ _CONFIRM_TEXT = re.compile(
     r"we have received your application|gracias por (tu|su) (candidatura|solicitud|inter[eé]s)|"
     r"(candidatura|solicitud) (enviada|recibida)|hemos recibido tu (candidatura|solicitud)", re.I)
 _CONFIRM_URL = re.compile(r"/(thanks|thank-you|thank_you|confirmation|confirm|success|submitted)\b", re.I)
+# A legitimate application never asks the candidate for money or card details.
+_PAYMENT = re.compile(
+    r"(application|registration|processing|admin(istration)?) fee|tasa de (inscripci[oó]n|tramitaci[oó]n)|"
+    r"cuota de inscripci[oó]n|credit card number|n[uú]mero de (la )?tarjeta|name=.?(card.?number|cvv|iban)\b", re.I)
 _APPLICATION_ID = re.compile(r"(application|candidatura|solicitud) (id|number|n[uú]mero|ref(erence)?)\s*[:#]?\s*[A-Z0-9-]{4,}", re.I)
 
 # JS: describe every form control and tag it (and its form) with data-jf-* ids.
@@ -148,6 +152,8 @@ def _blocked_reason(page) -> str:
     if (_LOGIN_URL.search(page.url or "") or re.search(r'type=["\']?password', html, re.I)
             or _LOGIN_TEXT.search(re.sub(r"<[^>]+>", " ", html))):
         return "Login required - manual application required (authentication never bypassed)"
+    if _PAYMENT.search(html):
+        return "Payment/fee requested - manual review required (never paid or filled automatically)"
     return ""
 
 
@@ -181,11 +187,12 @@ def _goto(page, url: str):
 
 
 def fill_application_form(page, url: str, answers: Dict[str, str], cv_path: Path,
-                          mode: str = DRY_RUN, cv_sha256: str = "") -> Dict:
+                          mode: str = DRY_RUN, cv_sha256: str = "", job: Optional[Dict] = None) -> Dict:
     """Drive one public application form on a Playwright-like `page`.
 
     Opens `url` (following at most two public "Apply" links to reach the form),
-    stops on CAPTCHA/login walls, uploads the fixed CV, fills only fields that
+    stops on CAPTCHA/login walls and (given `job`) on a page that shows some
+    other vacancy, uploads the fixed CV, fills only fields that
     map to truthful profile answers and reports everything else. The final
     submit button is clicked only in LIVE mode, after re-checking the CV hash.
 
@@ -204,6 +211,15 @@ def fill_application_form(page, url: str, answers: Dict[str, str], cv_path: Path
             result["reason"] = blocked
             report["final_url"] = page.url
             return result
+        if job and hop == 0:
+            # Target vacancy check on the route page, before anything is filled or uploaded.
+            from employer_routes import vacancy_evidence
+            report["vacancy_match"] = vacancy_evidence(job, page.url or url, page.content() or "")
+            if not report["vacancy_match"]["verified"]:
+                result["reason"] = ("Opened page does not show the target vacancy "
+                                    f"({job.get('title', '')}) - nothing filled, manual application required")
+                report["final_url"] = page.url
+                return result
         fields = _visible_fields(page)
         if any(f["type"] == "file" for f in fields) or hop == 2:
             break
@@ -366,7 +382,8 @@ def submit_application(app_id: int, profile: Dict, *, mode: Optional[str] = None
     if app.get("application_method") == WEB:
         from application_prep import is_login_walled
         route_url = app.get("application_url") or app["url"]
-        report = {"route_url": route_url, "route_type": app.get("route_type") or ""}
+        report = {"route_url": route_url, "route_type": app.get("route_type") or "",
+                  "cv_path": str(cv_path), "cv_sha256": app["cv_sha256"]}
         if is_login_walled(route_url):
             return _record(app_id, db, mode, MANUAL_REQUIRED,
                            "Application route is a login-walled job board - not automated", report=report)
@@ -378,7 +395,7 @@ def submit_application(app_id: int, profile: Dict, *, mode: Optional[str] = None
                            report=report)
         try:
             res = fill_application_form(page, route_url, answers, cv_path, mode=mode,
-                                        cv_sha256=app["cv_sha256"])
+                                        cv_sha256=app["cv_sha256"], job=app)
         except Exception as e:
             res = {"status": MANUAL_REQUIRED, "reason": f"Browser automation stopped: {e}", "evidence": ""}
         finally:
@@ -404,6 +421,37 @@ def submit_application(app_id: int, profile: Dict, *, mode: Optional[str] = None
         return _record(app_id, db, mode, SUBMISSION_FAILED, "Email sending failed")
 
     return _record(app_id, db, mode, MANUAL_REQUIRED, "No supported application method")
+
+
+def process_ready_applications(profile: Dict, *, db_path: Optional[Path] = None, limit: int = 10,
+                               page_factory: Optional[Callable] = None,
+                               email_sender: Optional[Callable] = None) -> Dict[str, int]:
+    """Pipeline step: run READY_TO_SUBMIT applications through submit_application.
+
+    DRY_RUN (default): validates each application once (already
+    DRY_RUN_VALIDATED ones are skipped); nothing is submitted or sent.
+    LIVE (both profile flags): submits each READY_TO_SUBMIT application once —
+    every LIVE outcome moves it out of READY_TO_SUBMIT, so nothing is retried
+    or resubmitted. Returns outcome counts."""
+    db = db_path or storage.DB_PATH
+    mode = get_submission_mode(profile)
+    conn = storage.get_db(db)
+    rows = conn.execute(
+        """SELECT a.id, a.submission_status FROM applications a JOIN jobs j ON a.job_url = j.url
+           WHERE a.status = ? AND j.qualification_status = ? AND COALESCE(a.submitted_at, '') = ''
+           ORDER BY a.id""", (READY_TO_SUBMIT, QUALIFIED)).fetchall()
+    conn.close()
+    ids = [r[0] for r in rows if mode == LIVE or (r[1] or "") != DRY_RUN_VALIDATED][:max(0, limit)]
+    counts: Dict[str, int] = {}
+    for app_id in ids:
+        try:
+            outcome = submit_application(app_id, profile, page_factory=page_factory,
+                                         email_sender=email_sender, db_path=db)["status"]
+        except Exception as e:  # one broken application never stops the run
+            logger.error("Application #%s could not be processed: %s", app_id, e)
+            outcome = "error"
+        counts[outcome] = counts.get(outcome, 0) + 1
+    return counts
 
 
 def _record(app_id: int, db: Path, mode: str, outcome: str, reason: str, evidence: str = "",

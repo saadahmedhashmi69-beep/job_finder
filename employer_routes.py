@@ -33,8 +33,8 @@ import submitter
 logger = logging.getLogger(__name__)
 
 SOURCE = "employer_search"
-# Hard bounds per job: 2 searches, 5 vacancy pages (+1 apply page for a verified one).
-MAX_QUERIES = 2
+# Hard bounds per job: 3 searches, 5 vacancy pages (+1 apply page for a verified one).
+MAX_QUERIES = 3
 MAX_RESULTS_PER_QUERY = 8
 MAX_CANDIDATES = 5
 TITLE_RATIO = 0.88      # near-exact job title
@@ -47,7 +47,14 @@ _GENERIC_COMPANY = {"grupo", "group", "spain", "espana", "empresa", "servicios",
                     "logistics", "transportes", "transport", "company", "international", "global", "iberia",
                     "trabajo", "temporal", "solutions", "soluciones", "jobs", "empleo", "careers"}
 _NO_COMPANY = {"unknown", "confidential", "confidencial", "empresa confidencial", "n a", "na", "none"}
-_GENDER_MARK =re.compile(r"\((?:[hmfdxw]\s*/\s*)+[hmfdxw]\)|\b[hmfdxw]/[hmfdxw](?:/[hmfdxw])?\b|/as?\b|\(a\)", re.I)
+# Job boards / aggregators are never the employer.
+_BOARD_NAMES = {"indeed", "linkedin", "glassdoor", "infojobs", "jooble", "adzuna", "simplyhired", "jobrapido",
+                "expertini", "stepstone", "monster", "jobtoday", "infoempleo"}
+# Where a public LinkedIn / Indeed posting prints the employer next to the job title.
+_ORG_SELECTORS = ("a.topcard__org-name-link", ".topcard__flavor a", "[data-company-name]",
+                  '[data-testid="inlineHeader-companyName"]')
+_NO_BOARDS = "-site:indeed.com -site:linkedin.com -site:glassdoor.com -site:glassdoor.es -site:jooble.org"
+_GENDER_MARK = re.compile(r"\((?:[hmfdxw]\s*/\s*)+[hmfdxw]\)|\b[hmfdxw]/[hmfdxw](?:/[hmfdxw])?\b|/as?\b|\(a\)", re.I)
 _TITLE_SEP = re.compile(r"\s+[|\-–—·:]\s+")
 _REF_RE = re.compile(r"\b(?:ref(?:erencia|erence)?|job\s*id|req(?:uisition)?(?:\s*id)?|id\s+de\s+(?:la\s+)?oferta)\b"
                      r"[\s.:#nº°-]*([A-Z0-9][A-Z0-9/_-]{3,})", re.I)
@@ -120,7 +127,8 @@ def _is_candidate(url: str, company: str) -> bool:
 
 def _queries(job: Dict) -> List[str]:
     company, title, city = (job.get("company") or "").strip(), _search_title(job), _city(job)
-    return [f'"{company}" "{title}" {city}'.strip(), f"{company} {title} {city}".strip()][:MAX_QUERIES]
+    return [f'"{company}" "{title}" {city}'.strip(), f"{company} {title} {city}".strip(),
+            f'"{company}" "{title}" {_NO_BOARDS}'][:MAX_QUERIES]
 
 
 def _job_postings(soup: BeautifulSoup) -> List[Dict]:
@@ -166,9 +174,7 @@ def _same_vacancy(job: Dict, url: str, page_html: str) -> Tuple[List[str], List[
     matched, missing = [], []
 
     city = _city(job)
-    want = _norm_title(job.get("title") or "", city)
-    if len(want) >= 4 and any(want == t or SequenceMatcher(None, want, t).ratio() >= TITLE_RATIO
-                              for t in (_norm_title(t, city) for t in titles) if t):
+    if any(_title_matches(job, t) for t in titles):
         matched.append("job title")
     else:
         missing.append("job title")
@@ -197,6 +203,59 @@ def _same_vacancy(job: Dict, url: str, page_html: str) -> Tuple[List[str], List[
     else:
         missing.append("location / vacancy reference / description overlap")
     return matched, missing
+
+
+def _title_matches(job: Dict, title: str) -> bool:
+    city = _city(job)
+    want, got = _norm_title(job.get("title") or "", city), _norm_title(title, city)
+    return len(want) >= 4 and bool(got) and (want == got or SequenceMatcher(None, want, got).ratio() >= TITLE_RATIO)
+
+
+def is_unnamed(company: str) -> bool:
+    """The job record has no real employer name ("Unknown", "", "Confidencial")."""
+    return not _norm(company) or _norm(company) in _NO_COMPANY
+
+
+def resolve_employer(job: Dict, fetch: Callable) -> str:
+    """Employer of a job stored without one, read from its own public posting.
+
+    Accepted only when the posting page ties the name to this exact vacancy:
+    a schema.org JobPosting with this job title and a hiringOrganization, or
+    the employer printed in the posting header under this job title. Job
+    boards/aggregators, placeholders and conflicting names are rejected.
+    Returns "" when the employer cannot be verified — nothing is guessed.
+    """
+    url = (job.get("url") or "").strip()
+    page = fetch(url) if prep._host(url) else None
+    if not page:
+        return ""
+    soup = BeautifulSoup(page[1] or "", "html.parser")
+    names = []
+    for posting in _job_postings(soup):
+        org = posting.get("hiringOrganization")
+        name = org.get("name") if isinstance(org, dict) else org
+        if isinstance(name, str) and _title_matches(job, str(posting.get("title") or "")):
+            names.append(name)
+    if any(_title_matches(job, h.get_text(" ", strip=True)) for h in soup.find_all("h1")):
+        names += [el.get_text(" ", strip=True) for sel in _ORG_SELECTORS for el in soup.select(sel)]
+    names = [" ".join(n.split()) for n in names if n and n.strip()]
+    if (len({_norm(n) for n in names}) != 1 or is_unnamed(names[0])
+            or _BOARD_NAMES & set(_norm(names[0]).split())):
+        return ""
+    return names[0]
+
+
+def vacancy_evidence(job: Dict, url: str, page_html: str) -> Dict:
+    """What an opened application page shows about the target vacancy.
+    `verified` is False only when the page has titles and neither they nor
+    its text carry this job's title (i.e. it is some other page)."""
+    titles, raw_text = _read_page(page_html)
+    matched, _ = _same_vacancy(job, url, page_html)
+    want = _norm_title(job.get("title") or "", _city(job))
+    in_text = bool(want) and f" {want} " in f" {_norm_title(raw_text)} "
+    if in_text and "job title" not in matched:
+        matched.insert(0, "job title in page text")
+    return {"matched": matched, "verified": not titles or "job title" in matched or in_text}
 
 
 class _StaticPage:
@@ -256,15 +315,21 @@ def discover_employer_route(job: Dict, *, search: Callable, fetch: Callable) -> 
     domain or a public ATS.
 
     `search(query, max_results) -> [url]`, `fetch(url) -> (final_url, html) | None`.
-    Returns {route_type, url, source, reason}; route_type/url are "" (and
+    Returns {route_type, url, source, employer, reason} (`employer` is set when an
+    unnamed employer was verified from the posting); route_type/url are "" (and
     `reason` says precisely why) when no verified route exists.
     """
-    none = {"route_type": "", "url": "", "source": ""}
+    none = {"route_type": "", "url": "", "source": "", "employer": ""}
     company = (job.get("company") or "").strip()
-    if (not _company_tokens(company) or _norm(company) in _NO_COMPANY
-            or not (job.get("title") or "").strip()):
-        return {**none, "reason": "Employer route search skipped: the posting does not name the employer "
-                                  "or the job title"}
+    if not (job.get("title") or "").strip():
+        return {**none, "reason": "Employer route search skipped: the job has no title"}
+    if is_unnamed(company):
+        # "Unknown" employer: use a name only if the public posting itself proves it.
+        company = resolve_employer(job, fetch)
+        if not company:
+            return {**none, "reason": "Employer route search skipped: the posting does not name the employer "
+                                      "and it could not be verified from the public job page"}
+        job, none = dict(job, company=company), {**none, "employer": company}
 
     candidates: List[str] = []
     searches = 0
@@ -307,6 +372,7 @@ def discover_employer_route(job: Dict, *, search: Callable, fetch: Callable) -> 
         ats = prep.ats_for_url(form_url)
         logger.info("Employer route for %s at %s: %s", job.get("title"), company, form_url)
         return {"route_type": ats or prep.EMPLOYER, "url": form_url, "source": SOURCE,
+                "employer": none["employer"],
                 "reason": f"Same vacancy found on the {ats + ' ATS' if ats else 'employer site'} by public web "
                           f"search (matched {', '.join(matched)}); public application form with CV upload"}
     return {**none, "reason": f"Employer route search: checked {len(rejected)} candidate page(s), none is a "

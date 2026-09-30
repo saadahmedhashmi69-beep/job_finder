@@ -256,5 +256,205 @@ class TestEmployerRouteRejected(EmployerRouteBase):
         self.assertEqual(web.queries, [])
 
 
+# --- Unknown employer resolution ------------------------------------------------
+
+UNKNOWN = dict(JOB, company="Unknown", url="https://es.indeed.com/viewjob?jk=unk1")
+
+
+def ld(title=JOB["title"], org="Reparto Rapido"):
+    return ('<script type="application/ld+json">{"@context": "https://schema.org", "@type": "JobPosting", '
+            f'"title": "{title}", "hiringOrganization": {{"@type": "Organization", "name": "{org}"}}}}</script>')
+
+
+def header(title=JOB["title"], org="Reparto Rapido"):
+    return f'<h1>{title}</h1><a class="topcard__org-name-link" href="#"> {org} </a>'
+
+
+class TestUnknownEmployer(EmployerRouteBase):
+    def resolve(self, page):
+        return employer_routes.resolve_employer(UNKNOWN, lambda u: (u, page) if page is not None else None)
+
+    def job_row(self, url):
+        conn = application_prep.storage.get_db(self.db)
+        row = dict(conn.execute("SELECT * FROM jobs WHERE url = ?", (url,)).fetchone())
+        conn.close()
+        return row
+
+    def test_employer_extracted_from_public_posting(self):
+        for page in (ld(), header(), ld() + header(), ld(title="Conductor de furgoneta (H/M)")):
+            self.assertEqual(self.resolve(page), "Reparto Rapido", page)
+
+    def test_employer_stays_unknown_when_ambiguous_or_unverified(self):
+        pages = {"not reachable": None,
+                 "no employer on page": "<h1>Conductor/a de furgoneta</h1><p>Buscamos repartidor.</p>",
+                 "name only in free text": "<h1>Conductor/a de furgoneta</h1><p>Reparto Rapido busca personal</p>",
+                 "other vacancy (json-ld)": ld(title="Mozo/a de almacen"),
+                 "other vacancy (header)": header(title="Ofertas de empleo"),
+                 "conflicting names": ld(org="Reparto Rapido") + header(org="Otra Empresa"),
+                 "job board as employer": ld(org="Indeed"),
+                 "aggregator as employer": header(org="Jooble Empleo"),
+                 "placeholder": ld(org="Confidencial")}
+        for name, page in pages.items():
+            with self.subTest(name):
+                self.assertEqual(self.resolve(page), "")
+
+    def test_unverified_employer_is_never_searched_or_saved(self):
+        app_id = self.manual(UNKNOWN)
+        web = FakeWeb([EMPLOYER_URL], {UNKNOWN["url"]: "<h1>Conductor/a de furgoneta</h1>", EMPLOYER_URL: vacancy()})
+        r = self.reprepare(web, UNKNOWN)
+        self.assertEqual((r["status"], r["app_id"]), (MANUAL_REQUIRED, app_id))
+        self.assertEqual(web.queries, [])  # no search from a guessed name
+        self.assertEqual(self.job_row(UNKNOWN["url"])["company"], "Unknown")
+        self.assertIn("could not be verified from the public job page", self.app_row(app_id)["status_reason"])
+
+    def test_resolved_employer_enables_route_search_and_updates_in_place(self):
+        app_id = self.manual(UNKNOWN)
+        before = self.job_row(UNKNOWN["url"])
+        web = FakeWeb([EMPLOYER_URL], {UNKNOWN["url"]: ld(), EMPLOYER_URL: vacancy()})
+        r = self.reprepare(web, UNKNOWN)
+        self.assertEqual((r["status"], r["app_id"]), (READY_TO_SUBMIT, app_id), r)
+        self.assertIn('"Reparto Rapido"', web.queries[0])
+        job = self.job_row(UNKNOWN["url"])
+        self.assertEqual(job["company"], "Reparto Rapido")
+        for key in ("url", "title", "board", "location", "description", "qualification_status"):
+            self.assertEqual(job[key], before[key], key)
+        app = self.app_row(app_id)
+        self.assertEqual((app["route_source"], app["application_url"], app["cv_sha256"]),
+                         ("employer_search", EMPLOYER_URL, self.cv_hash))
+        # Duplicate protection: by URL, and by title + (now resolved) employer on another board URL.
+        self.assertEqual(self.reprepare(web, UNKNOWN)["status"], "DUPLICATE")
+        twin = dict(UNKNOWN, company="Reparto Rapido", url="https://www.linkedin.com/jobs/view/777")
+        self.insert(twin)
+        self.assertEqual((self.reprepare(web, twin)["status"], self.count_apps()), ("DUPLICATE", 1))
+
+    def test_resolved_employer_without_route_is_saved_and_stays_manual(self):
+        app_id = self.manual(UNKNOWN)
+        web = FakeWeb([], {UNKNOWN["url"]: header()})
+        r = self.reprepare(web, UNKNOWN)
+        self.assertEqual((r["status"], r["app_id"]), (MANUAL_REQUIRED, app_id))
+        self.assertEqual(self.job_row(UNKNOWN["url"])["company"], "Reparto Rapido")
+        self.assertEqual(len(web.queries), employer_routes.MAX_QUERIES)
+
+    def test_cover_letter_never_addresses_a_placeholder_employer(self):
+        letter = application_prep.generate_cover_letter(UNKNOWN, self.profile, "driver")
+        self.assertNotIn("Unknown", letter)
+        self.assertIn("Dear Hiring Team at your company", letter)
+
+
+# --- Browser driver stops, DRY_RUN report, pipeline submission step --------------
+
+TITLE_HTML = "<h1>Conductor/a de furgoneta</h1><form></form>"
+GH_URL = "https://job-boards.greenhouse.io/reparto/jobs/"
+
+
+class TestDriverAndPipelineStep(RouteBase):
+    def live(self, mode="LIVE", allow=True):
+        self.profile["pipeline"].update({"submission_mode": mode, "allow_live_submission": allow})
+
+    def process(self, site, sender=None):
+        factory = mock.Mock(side_effect=lambda: (site, lambda: None))
+        counts = submitter.process_ready_applications(self.profile, db_path=self.db, page_factory=factory,
+                                                      email_sender=sender)
+        return counts, factory
+
+    def test_dry_run_report_has_route_vacancy_cv_and_field_evidence(self):
+        url = GH_URL + "r1"
+        app_id = self.ready(dict(DRIVER, url=url))
+        site = FakeSite({url: {"html": TITLE_HTML, "fields": APPLY_FORM}}, after_html="<p>Thank you for applying</p>")
+        res = self.submit(app_id, site)
+        self.assertEqual(res["status"], submitter.DRY_RUN_VALIDATED, res)
+        rep = self.report(app_id)
+        self.assertEqual((rep["route_url"], rep["route_type"]), (url, "greenhouse"))
+        self.assertEqual((rep["cv_path"], rep["cv_sha256"], rep["cv_uploaded"]),
+                         (str(FIXED_CV), self.cv_hash, str(FIXED_CV)))
+        self.assertTrue(rep["vacancy_match"]["verified"])
+        self.assertIn("job title", rep["vacancy_match"]["matched"])
+        self.assertIn("Email", rep["fields_prepared"])
+        self.assertEqual(rep["fields_manual"], [])
+        self.assertFalse(site.clicked)
+
+    def test_other_vacancy_and_payment_pages_stop_before_anything_is_filled(self):
+        cases = {"other vacancy": ("<html><head><title>Mozo de almacen - Reparto</title></head>"
+                                   "<h1>Mozo de almacen</h1><form></form></html>", "does not show the target vacancy"),
+                 "fee": (TITLE_HTML + "<p>A registration fee of 30 EUR applies.</p>", "Payment/fee requested"),
+                 "card": (TITLE_HTML + '<input name="card_number">', "Payment/fee requested")}
+        self.live()  # even with LIVE fully enabled
+        for i, (name, (page_html, reason)) in enumerate(cases.items()):
+            with self.subTest(name):
+                url = f"{GH_URL}x{i}"
+                app_id = self.ready(dict(DRIVER, url=url))
+                site = FakeSite({url: {"html": page_html, "fields": APPLY_FORM}})
+                res = self.submit(app_id, site)
+                self.assertEqual(res["status"], MANUAL_REQUIRED)
+                self.assertIn(reason, res["reason"])
+                self.assertEqual((site.uploads, site.filled, site.clicked), ([], {}, False))
+
+    def test_pipeline_step_dry_run_validates_once_and_never_submits(self):
+        url = GH_URL + "p1"
+        app_id = self.ready(dict(DRIVER, url=url))
+        manual_job = dict(DRIVER, url="https://www.linkedin.com/jobs/view/555", company="Otra SL")
+        self.insert(manual_job)
+        application_prep.prepare_application(manual_job, self.profile, matcher=self.m, db_path=self.db,
+                                             fetch=lambda u: None, search=lambda q, n: [])
+        self.live("LIVE", False)  # one flag alone is still DRY_RUN
+        site = FakeSite({url: {"html": TITLE_HTML, "fields": APPLY_FORM}}, after_html="<p>Thank you for applying</p>")
+        counts, factory = self.process(site)
+        self.assertEqual(counts, {submitter.DRY_RUN_VALIDATED: 1})  # MANUAL_REQUIRED app untouched
+        self.assertFalse(site.clicked)
+        app = self.app_row(app_id)
+        self.assertEqual((app["status"], app["submission_mode"], app["submitted_at"]), (READY_TO_SUBMIT, "DRY_RUN", ""))
+        counts, factory = self.process(site)
+        self.assertEqual(counts, {})
+        factory.assert_not_called()
+
+    def test_pipeline_step_live_submits_once_with_evidence_and_never_again(self):
+        self.live()
+        url = GH_URL + "p2"
+        app_id = self.ready(dict(DRIVER, url=url))
+        site = FakeSite({url: {"html": TITLE_HTML, "fields": APPLY_FORM}}, after_html="<p>Thank you for applying!</p>")
+        counts, _ = self.process(site)
+        self.assertEqual(counts, {"SUBMITTED": 1})
+        app = self.app_row(app_id)
+        self.assertTrue(app["submission_evidence"] and app["submitted_at"])
+        self.assertEqual(site.uploads, [str(FIXED_CV)])
+        again = FakeSite({url: {"html": TITLE_HTML, "fields": APPLY_FORM}})
+        counts, factory = self.process(again)
+        self.assertEqual(counts, {})
+        factory.assert_not_called()
+        self.assertIn("duplicate submission blocked", self.submit(app_id, again, mode=submitter.LIVE)["reason"])
+        self.assertFalse(again.clicked)
+
+    def test_pipeline_step_live_ambiguous_result_is_not_submitted_or_retried(self):
+        self.live()
+        url = GH_URL + "p3"
+        app_id = self.ready(dict(DRIVER, url=url))
+        site = FakeSite({url: {"html": TITLE_HTML, "fields": APPLY_FORM}}, after_html="<form>try again</form>")
+        self.assertEqual(self.process(site)[0], {"SUBMISSION_FAILED": 1})
+        app = self.app_row(app_id)
+        self.assertEqual((app["status"], app["submitted_at"], app["submission_evidence"]), ("SUBMISSION_FAILED", "", ""))
+        counts, factory = self.process(site)
+        self.assertEqual(counts, {})
+        factory.assert_not_called()
+
+    def test_pipeline_step_email_is_never_sent_in_dry_run_nor_submitted_in_live(self):
+        job = dict(DRIVER, url="https://www.linkedin.com/jobs/view/88",
+                   description=DRIVER["description"] + " Envia tu CV a empleo@repartorapido.es")
+        self.insert(job)
+        r = application_prep.prepare_application(job, self.profile, matcher=self.m, db_path=self.db,
+                                                 fetch=lambda u: None, search=lambda q, n: [])
+        self.assertEqual((r["status"], r["method"]), (READY_TO_SUBMIT, "EMAIL"))
+        sender = mock.Mock(return_value=True)
+        self.assertEqual(self.process(None, sender)[0], {submitter.DRY_RUN_VALIDATED: 1})
+        sender.assert_not_called()
+        self.live()
+        self.assertEqual(self.process(None, sender)[0], {"SMTP_ACCEPTED": 1})
+        sender.assert_called_once()
+        self.assertEqual(sender.call_args.kwargs["cv_path"], FIXED_CV)
+        app = self.app_row(r["app_id"])
+        self.assertEqual((app["status"], app["submitted_at"]), ("SMTP_ACCEPTED", ""))
+        self.assertEqual(self.process(None, sender)[0], {})
+        sender.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

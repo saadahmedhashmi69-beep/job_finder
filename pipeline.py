@@ -221,6 +221,15 @@ def run_pipeline(
                     log_lines.append(f"Re-routed {rerouted} MANUAL_REQUIRED application(s) to READY_TO_SUBMIT")
             except Exception as e:
                 logger.error("Route re-discovery failed: %s", e)
+            # READY_TO_SUBMIT applications: DRY_RUN validation by default; real
+            # submission only when LIVE is enabled by both profile flags.
+            try:
+                import submitter
+                outcomes = submitter.process_ready_applications(profile, limit=max_applications)
+                if outcomes:
+                    log_lines.append(f"Submission step ({submitter.get_submission_mode(profile)}): {outcomes}")
+            except Exception as e:
+                logger.error("Submission step failed: %s", e)
 
         # --- Step 4: Send email digest ---
         logger.info("=== Pipeline Step 4: Email digest ===")
