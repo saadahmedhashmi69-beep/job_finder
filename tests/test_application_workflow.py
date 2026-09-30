@@ -140,7 +140,8 @@ class WorkflowBase(unittest.TestCase):
                   mock.patch.object(cv_customizer, "analyze_job", side_effect=_forbid),
                   mock.patch("smtplib.SMTP_SSL", side_effect=AssertionError("real SMTP used")),
                   # Route discovery never reaches the network in tests.
-                  mock.patch.object(application_prep, "_http_fetch", return_value=None)):
+                  mock.patch.object(application_prep, "_http_fetch", return_value=None),
+                  mock.patch.object(application_prep, "_web_search", return_value=[])):
             p.start()
             self.addCleanup(p.stop)
         self.m = matcher.JobMatcher(self.profile)

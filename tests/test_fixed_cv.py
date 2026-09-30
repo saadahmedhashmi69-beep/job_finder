@@ -133,6 +133,7 @@ class TestPipelineUsesFixedCV(FixedCVTestBase):
             # No real jobs.db reads/writes and no network from route re-discovery.
             mock.patch.object(application_prep, "reroute_manual_applications", return_value=0),
             mock.patch.object(application_prep, "_http_fetch", return_value=None),
+            mock.patch.object(application_prep, "_web_search", return_value=[]),
             mock.patch.object(cv_customizer, "analyze_job", return_value={}),
             mock.patch.object(cv_customizer, "customize_cv_for_job", side_effect=_forbid_customize),
             mock.patch.object(cv_customizer, "compile_latex", side_effect=_forbid_customize),

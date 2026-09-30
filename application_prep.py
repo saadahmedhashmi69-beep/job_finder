@@ -268,6 +268,12 @@ def _http_fetch(url: str):
         return None
 
 
+def _web_search(query: str, max_results: int = 8) -> List[str]:
+    """Result URLs of one public web search (see employer_routes)."""
+    from employer_routes import web_search
+    return web_search(query, max_results)
+
+
 def _route(url: str, source: str, reason: str) -> Dict:
     ats = ats_for_url(url)
     return {"route_type": ats or EMPLOYER, "url": normalize_application_url(url, ats),
@@ -311,11 +317,15 @@ def discover_application_route(job: Dict, fetch: Optional[Callable] = None) -> D
     return {"route_type": "", "url": "", "source": "", "reason": ""}
 
 
-def detect_application_method(job: Dict, recruiter_email: str = "", fetch: Optional[Callable] = None) -> Dict:
+def detect_application_method(job: Dict, recruiter_email: str = "", fetch: Optional[Callable] = None,
+                              search: Optional[Callable] = None) -> Dict:
     """Return {method: WEB|EMAIL|MANUAL_REQUIRED, ats, route_type, url, source, email, reason}.
 
     `fetch` (url -> (final_url, html) | None) enables looking inside job-board
-    postings; without it no network is used.
+    postings; without it no network is used. With `search`
+    ((query, max_results) -> [url]) as well, a job that would otherwise be
+    MANUAL_REQUIRED gets one bounded employer route search first
+    (employer_routes.discover_employer_route).
     """
     url = (job.get("url") or "").strip()
     email = find_application_email(job, recruiter_email)
@@ -328,16 +338,25 @@ def detect_application_method(job: Dict, recruiter_email: str = "", fetch: Optio
     if _host(url) and not is_job_board(url):
         return {"method": WEB, "ats": "generic", "route_type": EMPLOYER, "url": url, "source": "job_url",
                 "email": "", "reason": "Generic web form (attempted; stops as MANUAL_REQUIRED if unsupported)"}
+    reason = ("No public application route: the job-board posting (LinkedIn/Indeed/...) exposes no "
+              "employer/ATS application URL and no application email" if _host(url)
+              else "No application URL or email")
+    if fetch and search:
+        # Last resort: the same vacancy on the employer's own site / a public ATS.
+        from employer_routes import discover_employer_route
+        found = discover_employer_route(job, search=search, fetch=fetch)
+        if found["url"]:
+            return {"method": WEB, "ats": found["route_type"], "email": "", **found}
+        reason = f"{reason}. {found['reason']}"
     return {"method": MANUAL_REQUIRED, "ats": "", "route_type": "", "url": "", "source": "", "email": "",
-            "reason": ("No public application route: the job-board posting (LinkedIn/Indeed/...) exposes no "
-                       "employer/ATS application URL and no application email" if _host(url)
-                       else "No application URL or email")}
+            "reason": reason}
 
 
 # --- Preparation -------------------------------------------------------------
 
 def prepare_application(job: Dict, profile: Dict, *, matcher=None,
-                        db_path: Optional[Path] = None, fetch: Optional[Callable] = None) -> Dict:
+                        db_path: Optional[Path] = None, fetch: Optional[Callable] = None,
+                        search: Optional[Callable] = None) -> Dict:
     """Qualify a job and, only if QUALIFIED, prepare its application package.
 
     Returns {"status", "app_id", "reasons", "method"}; status is the job's
@@ -352,7 +371,7 @@ def prepare_application(job: Dict, profile: Dict, *, matcher=None,
         # READY_TO_SUBMIT) is left untouched and reported as a duplicate.
         if needs_route(existing) and _job_qualified(existing["job_url"], db):
             return reroute_application(existing, dict(job, url=existing["job_url"]), profile=profile,
-                                       db_path=db, fetch=fetch or _http_fetch)
+                                       db_path=db, fetch=fetch or _http_fetch, search=search)
         return {"status": "DUPLICATE", "app_id": existing["id"],
                 "reasons": [f"Already has application #{existing['id']} ({existing['status']})"],
                 "method": existing.get("application_method", "")}
@@ -384,7 +403,7 @@ def prepare_application(job: Dict, profile: Dict, *, matcher=None,
         email_body=letter,
     )
 
-    method = detect_application_method(job, fetch=fetch or _http_fetch)
+    method = detect_application_method(job, fetch=fetch or _http_fetch, search=search or _web_search)
     status = MANUAL_REQUIRED if method["method"] == MANUAL_REQUIRED else READY_TO_SUBMIT
     storage.update_application(
         app_id, db_path=db, status=status, application_method=method["method"],
@@ -411,18 +430,20 @@ def _job_qualified(job_url: str, db: Path) -> bool:
 
 
 def reroute_application(app: Dict, job: Dict, *, profile: Optional[Dict] = None,
-                        db_path: Optional[Path] = None, fetch: Optional[Callable] = None) -> Dict:
+                        db_path: Optional[Path] = None, fetch: Optional[Callable] = None,
+                        search: Optional[Callable] = None) -> Dict:
     """Re-run route discovery for an existing route-less MANUAL_REQUIRED
     application and update it in place. Uses the job URL, the posting
     description, the board apply URL and any URL already saved on the
-    application. A found route makes it READY_TO_SUBMIT only while the
+    application, then the bounded employer route search.
+    A found route makes it READY_TO_SUBMIT only while the
     recorded fixed CV is still byte-identical; otherwise it stays
     MANUAL_REQUIRED with the reason recorded. Nothing is submitted or sent.
     Returns the same shape as prepare_application."""
     db = _db(db_path)
     app_id = app["id"]
     job = dict(job, apply_url=job.get("apply_url") or app.get("application_url") or "")
-    method = detect_application_method(job, fetch=fetch or _http_fetch)
+    method = detect_application_method(job, fetch=fetch or _http_fetch, search=search or _web_search)
     if method["method"] == MANUAL_REQUIRED:
         reason = f"Route re-check: {method['reason']}"
         storage.update_application(app_id, db_path=db, status_reason=reason)
@@ -449,7 +470,8 @@ def reroute_application(app: Dict, job: Dict, *, profile: Optional[Dict] = None,
             "reasons": [f"Existing application #{app_id}: {reason}"], "method": method["method"]}
 
 
-def reroute_manual_applications(db_path: Optional[Path] = None, fetch: Optional[Callable] = None) -> int:
+def reroute_manual_applications(db_path: Optional[Path] = None, fetch: Optional[Callable] = None,
+                                search: Optional[Callable] = None) -> int:
     """Re-run route discovery for QUALIFIED jobs whose application is MANUAL_REQUIRED
     only because no route was known. A found route makes it READY_TO_SUBMIT.
     Nothing is submitted. Returns the number of applications re-routed."""
@@ -465,6 +487,6 @@ def reroute_manual_applications(db_path: Optional[Path] = None, fetch: Optional[
         app = storage.get_application_by_job(row["url"], db_path=db)
         if not app or app["id"] != row["app_id"] or not needs_route(app):
             continue
-        if reroute_application(app, row, db_path=db, fetch=fetch)["status"] == READY_TO_SUBMIT:
+        if reroute_application(app, row, db_path=db, fetch=fetch, search=search)["status"] == READY_TO_SUBMIT:
             rerouted += 1
     return rerouted
