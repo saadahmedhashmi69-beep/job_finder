@@ -347,6 +347,12 @@ def prepare_application(job: Dict, profile: Dict, *, matcher=None,
     existing = storage.find_existing_application(job["url"], job.get("title", ""),
                                                  job.get("company", ""), db_path=db)
     if existing:
+        # A route-less MANUAL_REQUIRED application is re-checked for a public
+        # employer/ATS route and updated in place; anything else (e.g.
+        # READY_TO_SUBMIT) is left untouched and reported as a duplicate.
+        if needs_route(existing) and _job_qualified(existing["job_url"], db):
+            return reroute_application(existing, dict(job, url=existing["job_url"]), profile=profile,
+                                       db_path=db, fetch=fetch or _http_fetch)
         return {"status": "DUPLICATE", "app_id": existing["id"],
                 "reasons": [f"Already has application #{existing['id']} ({existing['status']})"],
                 "method": existing.get("application_method", "")}
@@ -390,6 +396,59 @@ def prepare_application(job: Dict, profile: Dict, *, matcher=None,
     return {"status": status, "app_id": app_id, "reasons": [method["reason"]], "method": method["method"]}
 
 
+def needs_route(app: Dict) -> bool:
+    """MANUAL_REQUIRED only because no application route was known."""
+    return (app.get("status") == MANUAL_REQUIRED
+            and (app.get("application_method") or MANUAL_REQUIRED) == MANUAL_REQUIRED
+            and not (app.get("application_url") or "").strip())
+
+
+def _job_qualified(job_url: str, db: Path) -> bool:
+    conn = storage.get_db(db)
+    row = conn.execute("SELECT qualification_status FROM jobs WHERE url = ?", (job_url,)).fetchone()
+    conn.close()
+    return bool(row) and row[0] == QUALIFIED
+
+
+def reroute_application(app: Dict, job: Dict, *, profile: Optional[Dict] = None,
+                        db_path: Optional[Path] = None, fetch: Optional[Callable] = None) -> Dict:
+    """Re-run route discovery for an existing route-less MANUAL_REQUIRED
+    application and update it in place. Uses the job URL, the posting
+    description, the board apply URL and any URL already saved on the
+    application. A found route makes it READY_TO_SUBMIT only while the
+    recorded fixed CV is still byte-identical; otherwise it stays
+    MANUAL_REQUIRED with the reason recorded. Nothing is submitted or sent.
+    Returns the same shape as prepare_application."""
+    db = _db(db_path)
+    app_id = app["id"]
+    job = dict(job, apply_url=job.get("apply_url") or app.get("application_url") or "")
+    method = detect_application_method(job, fetch=fetch or _http_fetch)
+    if method["method"] == MANUAL_REQUIRED:
+        reason = f"Route re-check: {method['reason']}"
+        storage.update_application(app_id, db_path=db, status_reason=reason)
+        return {"status": MANUAL_REQUIRED, "app_id": app_id,
+                "reasons": [f"Existing application #{app_id} re-checked; still MANUAL_REQUIRED: {method['reason']}"],
+                "method": MANUAL_REQUIRED}
+
+    # Same fixed CV as when the application was prepared, byte for byte.
+    cv_path = Path(app.get("cv_pdf_path") or "")
+    cv_problem = ""
+    if not cv_path.is_file() or not app.get("cv_sha256") or sha256_file(cv_path) != app["cv_sha256"]:
+        cv_problem = "fixed CV missing or its SHA-256 no longer matches the recorded checksum"
+    elif profile is not None and cv_path.resolve() != resolve_fixed_cv_path(profile).resolve():
+        cv_problem = "recorded CV is not the configured fixed CV"
+    status = MANUAL_REQUIRED if cv_problem else READY_TO_SUBMIT
+    reason = (f"Route found ({method['reason']}) but {cv_problem}" if cv_problem
+              else f"Re-routed: {method['reason']}")
+    storage.update_application(
+        app_id, db_path=db, status=status, application_method=method["method"],
+        recruiter_email=method["email"], status_reason=reason,
+        application_url=method["url"], route_type=method["route_type"], route_source=method["source"])
+    logger.info("Re-routed application #%s -> %s (%s %s)", app_id, status, method["route_type"], method["url"])
+    return {"status": status, "app_id": app_id,
+            "reasons": [f"Existing application #{app_id}: {reason}"], "method": method["method"]}
+
+
 def reroute_manual_applications(db_path: Optional[Path] = None, fetch: Optional[Callable] = None) -> int:
     """Re-run route discovery for QUALIFIED jobs whose application is MANUAL_REQUIRED
     only because no route was known. A found route makes it READY_TO_SUBMIT.
@@ -398,17 +457,14 @@ def reroute_manual_applications(db_path: Optional[Path] = None, fetch: Optional[
     conn = storage.get_db(db)
     rows = [dict(r) for r in conn.execute(
         """SELECT j.*, a.id AS app_id FROM applications a JOIN jobs j ON a.job_url = j.url
-           WHERE a.status = ? AND a.application_method = ? AND j.qualification_status = ?""",
-        (MANUAL_REQUIRED, MANUAL_REQUIRED, QUALIFIED))]
+           WHERE a.status = ? AND j.qualification_status = ?""",
+        (MANUAL_REQUIRED, QUALIFIED))]
     conn.close()
     rerouted = 0
     for row in rows:
-        method = detect_application_method(row, fetch=fetch or _http_fetch)
-        if method["method"] == MANUAL_REQUIRED:
+        app = storage.get_application_by_job(row["url"], db_path=db)
+        if not app or app["id"] != row["app_id"] or not needs_route(app):
             continue
-        storage.update_application(
-            row["app_id"], db_path=db, status=READY_TO_SUBMIT, application_method=method["method"],
-            recruiter_email=method["email"], status_reason=method["reason"],
-            application_url=method["url"], route_type=method["route_type"], route_source=method["source"])
-        rerouted += 1
+        if reroute_application(app, row, db_path=db, fetch=fetch)["status"] == READY_TO_SUBMIT:
+            rerouted += 1
     return rerouted

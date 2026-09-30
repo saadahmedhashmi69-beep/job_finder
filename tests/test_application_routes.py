@@ -367,5 +367,100 @@ class TestSubmissionSafety(RouteBase):
                          SUBMISSION_FAILED)
 
 
+
+class TestExistingManualReroute(RouteBase):
+    """`prepare` re-checks existing route-less MANUAL_REQUIRED applications in place."""
+
+    def manual(self, url):
+        job = dict(DRIVER, url=url, company=f"Reparto {hashlib.md5(url.encode()).hexdigest()[:6]}")
+        self.insert(job)
+        r = application_prep.prepare_application(job, self.profile, matcher=self.m, db_path=self.db,
+                                                 fetch=lambda u: None)
+        self.assertEqual(r["status"], MANUAL_REQUIRED, r)
+        return job, r["app_id"]
+
+    def reprepare(self, job, fetch):
+        return application_prep.prepare_application(job, self.profile, matcher=self.m, db_path=self.db,
+                                                    fetch=fetch)
+
+    def test_existing_manual_gets_route_discovery_attempted(self):
+        job, app_id = self.manual("https://es.indeed.com/viewjob?jk=m1")
+        fetched = []
+        r = self.reprepare(job, lambda u: fetched.append(u) or None)
+        self.assertEqual(fetched, [job["url"]])
+        self.assertNotEqual(r["status"], "DUPLICATE")
+        self.assertEqual((r["status"], r["app_id"]), (MANUAL_REQUIRED, app_id))
+
+    def test_discovered_route_updates_existing_application(self):
+        cases = [
+            ("greenhouse", '<a href="https://job-boards.greenhouse.io/reparto/jobs/9">Apply</a>', None,
+             "https://job-boards.greenhouse.io/reparto/jobs/9"),
+            ("lever", '<a href="https://jobs.lever.co/reparto/abc">Apply</a>', None,
+             "https://jobs.lever.co/reparto/abc/apply"),
+            ("workable", '<a href="https://apply.workable.com/reparto/j/AB12/">Apply</a>', None,
+             "https://apply.workable.com/reparto/j/AB12/apply/"),
+            ("ashby", '<a href="https://jobs.ashbyhq.com/reparto/1f2e">Apply</a>', None,
+             "https://jobs.ashbyhq.com/reparto/1f2e/application"),
+            ("employer", "<html></html>", "https://careers.reparto.es/ofertas/7/aplicar",
+             "https://careers.reparto.es/ofertas/7/aplicar"),
+        ]
+        for i, (route, page, redirect, expected) in enumerate(cases):
+            with self.subTest(route=route):
+                job, app_id = self.manual(f"https://es.indeed.com/viewjob?jk=r{i}")
+                before = self.count_apps()
+                r = self.reprepare(job, lambda u: (redirect or u, page))
+                self.assertEqual((r["status"], r["app_id"]), (READY_TO_SUBMIT, app_id), r)
+                self.assertEqual(self.count_apps(), before)  # updated in place, not duplicated
+                app = self.app_row(app_id)
+                self.assertEqual((app["status"], app["application_method"], app["route_type"],
+                                  app["application_url"]), (READY_TO_SUBMIT, "WEB", route, expected))
+                self.assertIn(app["route_source"], ("job_page", "job_page_redirect"))
+                self.assertEqual(Path(app["cv_pdf_path"]), FIXED_CV)
+                self.assertEqual(app["cv_sha256"], self.cv_hash)
+                self.assertEqual((app["submission_status"], app["submitted_at"], app["sent_at"]), ("", "", ""))
+
+    def test_existing_manual_without_route_stays_manual(self):
+        job, app_id = self.manual("https://es.indeed.com/viewjob?jk=n1")
+        r = self.reprepare(job, lambda u: (u, "<p>Inicia sesion para postularte</p>"))
+        self.assertEqual((r["status"], r["app_id"]), (MANUAL_REQUIRED, app_id))
+        app = self.app_row(app_id)
+        self.assertEqual((app["status"], app["application_url"], app["route_type"], app["recruiter_email"]),
+                         (MANUAL_REQUIRED, "", "", ""))
+        self.assertTrue(app["status_reason"].startswith("Route re-check: No public application route"))
+        self.assertEqual(self.count_apps(), 1)
+
+    def test_changed_cv_checksum_blocks_ready(self):
+        job, app_id = self.manual("https://es.indeed.com/viewjob?jk=c1")
+        storage.update_application(app_id, db_path=self.db, cv_sha256="0" * 64)
+        r = self.reprepare(job, lambda u: (u, '<a href="https://jobs.lever.co/reparto/q">Apply</a>'))
+        self.assertEqual(r["status"], MANUAL_REQUIRED)
+        self.assertIn("SHA-256", self.app_row(app_id)["status_reason"])
+
+    def test_existing_ready_to_submit_is_not_duplicated_or_reset(self):
+        url = "https://job-boards.greenhouse.io/reparto/jobs/d1"
+        job = dict(DRIVER, url=url, company=f"Reparto {hashlib.md5(url.encode()).hexdigest()[:6]}")
+        app_id = self.ready(job)
+        before = self.app_row(app_id)
+        fetched = []
+        r = self.reprepare(job, lambda u: fetched.append(u))
+        self.assertEqual((r["status"], r["app_id"]), ("DUPLICATE", app_id))
+        self.assertEqual(self.count_apps(), 1)
+        self.assertEqual(self.app_row(app_id), before)
+        self.assertEqual(fetched, [])
+
+    def test_rerouted_application_dry_run_never_submits_or_emails(self):
+        job, app_id = self.manual("https://es.indeed.com/viewjob?jk=s1")
+        gh = "https://job-boards.greenhouse.io/reparto/jobs/s1"
+        self.reprepare(job, lambda u: (u, f'<a href="{gh}">Apply</a>'))
+        site = FakeSite({gh: {"fields": APPLY_FORM}}, after_html="<h1>Thank you for applying!</h1>")
+        with mock.patch("smtplib.SMTP", side_effect=AssertionError("SMTP used")):
+            res = self.submit(app_id, site)
+        self.assertEqual(res["status"], submitter.DRY_RUN_VALIDATED, res)
+        self.assertFalse(site.clicked)
+        self.assertEqual(site.uploads, [str(FIXED_CV)])
+        app = self.app_row(app_id)
+        self.assertEqual((app["status"], app["submitted_at"], app["sent_at"]), (READY_TO_SUBMIT, "", ""))
+
+
 if __name__ == "__main__":
     unittest.main()
