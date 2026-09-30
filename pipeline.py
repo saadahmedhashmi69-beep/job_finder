@@ -186,6 +186,7 @@ def run_pipeline(
         logger.info("Using fixed CV for all applications: %s", fixed_cv)
         matcher = JobMatcher(profile)
         qual_counts = {}
+        route_checked = set()  # application ids route-checked during this run
 
         for i, job in enumerate(candidates):
             if _shutdown:
@@ -200,6 +201,7 @@ def run_pipeline(
                 result = prepare_application(job, profile, matcher=matcher)
                 qual_counts[result["status"]] = qual_counts.get(result["status"], 0) + 1
                 if result["app_id"] and result["status"] != "DUPLICATE":
+                    route_checked.add(result["app_id"])
                     stats["applications_created"] += 1
                     log_lines.append(f"{result['status']}: {job['title']} at {job['company']}")
                 else:
@@ -214,9 +216,16 @@ def run_pipeline(
         if not dry_run and not _shutdown:
             # Earlier route-less MANUAL_REQUIRED applications: look for a public
             # employer/ATS route again (discovery only; nothing is submitted).
+            # Applications already route-checked above are not discovered twice.
             try:
-                from application_prep import reroute_manual_applications
-                rerouted = reroute_manual_applications()
+                import application_prep
+                needs_route = application_prep.needs_route
+                application_prep.needs_route = (
+                    lambda app: app.get("id") not in route_checked and needs_route(app))
+                try:
+                    rerouted = application_prep.reroute_manual_applications()
+                finally:
+                    application_prep.needs_route = needs_route
                 if rerouted:
                     log_lines.append(f"Re-routed {rerouted} MANUAL_REQUIRED application(s) to READY_TO_SUBMIT")
             except Exception as e:

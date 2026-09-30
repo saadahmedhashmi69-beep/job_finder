@@ -461,6 +461,28 @@ class TestExistingManualReroute(RouteBase):
         app = self.app_row(app_id)
         self.assertEqual((app["status"], app["submitted_at"], app["sent_at"]), (READY_TO_SUBMIT, "", ""))
 
+    def test_pipeline_run_does_not_reroute_the_same_application_twice(self):
+        import pipeline
+        checked, _ = self.manual("https://es.indeed.com/viewjob?jk=p1")  # re-checked by prepare this run
+        older, _ = self.manual("https://es.indeed.com/viewjob?jk=p2")    # only the fallback reaches it
+        needs_route = application_prep.needs_route
+        with mock.patch.object(storage, "DB_PATH", self.db), \
+                mock.patch.object(pipeline, "_scrape_all", return_value=[]), \
+                mock.patch.object(pipeline, "JobMatcher", return_value=self.m), \
+                mock.patch.object(pipeline, "save_jobs", return_value=0), \
+                mock.patch.object(pipeline, "get_top_jobs", return_value=[checked]), \
+                mock.patch.object(pipeline, "find_existing_application", return_value=None), \
+                mock.patch.object(pipeline, "start_pipeline_run", return_value=1), \
+                mock.patch.object(pipeline, "finish_pipeline_run"), \
+                mock.patch.object(pipeline, "should_send_digest", return_value=False), \
+                mock.patch("submitter.process_ready_applications", return_value={}), \
+                mock.patch.object(application_prep, "detect_application_method",
+                                  wraps=application_prep.detect_application_method) as detect:
+            pipeline.run_pipeline(profile=self.profile)
+        self.assertEqual(sorted(c.args[0]["url"] for c in detect.call_args_list),
+                         sorted([checked["url"], older["url"]]))
+        self.assertIs(application_prep.needs_route, needs_route)
+
 
 if __name__ == "__main__":
     unittest.main()
