@@ -108,6 +108,7 @@ class Job:
     date_posted: str = ""
     job_type: str = ""  # full-time, part-time, contract
     is_remote: bool = False  # fully remote / home-office
+    apply_url: str = ""  # direct employer/ATS application URL exposed by the board, if any
     scraped_at: str = field(default_factory=lambda: datetime.now().isoformat())
     match_score: float = 0.0
     match_details: Dict = field(default_factory=dict)
@@ -129,6 +130,7 @@ class Job:
             "date_posted": self.date_posted,
             "job_type": self.job_type,
             "is_remote": self.is_remote,
+            "apply_url": self.apply_url,
             "scraped_at": self.scraped_at,
             "match_score": self.match_score,
             "match_details": self.match_details,

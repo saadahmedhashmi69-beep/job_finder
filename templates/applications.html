@@ -16,7 +16,7 @@ Submission mode: <strong>{{ submission_mode }}</strong>{% if submission_mode == 
             <th>Match score</th>
             <th>Qualification</th>
             <th>Application status</th>
-            <th>Method</th>
+            <th>Application route</th>
             <th>Submission</th>
             <th>Recruiter Email</th>
             <th>CV</th>
@@ -38,9 +38,33 @@ Submission mode: <strong>{{ submission_mode }}</strong>{% if submission_mode == 
                 </span>
                 {% if app.status_reason %}<br><small style="color:#6b7280">{{ app.status_reason }}</small>{% endif %}
             </td>
-            <td>{{ app.application_method or '—' }}</td>
-            <td>{{ app.submission_status or 'not attempted' }}{% if app.submission_mode %} <small>({{ app.submission_mode }})</small>{% endif %}
-                {% if app.submission_evidence %}<br><small>{{ app.submission_evidence }}</small>{% endif %}</td>
+            <td style="min-width:220px">
+                <strong>{{ app.application_method or '—' }}</strong>{% if app.route_type %} · {{ app.route_type }}{% endif %}
+                {% if app.route_source %}<br><small style="color:#6b7280">found via {{ app.route_source }}</small>{% endif %}
+                {% if app.application_url %}<br><small><a href="{{ app.application_url }}" target="_blank" rel="noopener" style="word-break:break-all">{{ app.application_url }}</a></small>
+                {% elif app.application_method == 'EMAIL' and app.recruiter_email %}<br><small>{{ app.recruiter_email }}</small>{% endif %}
+            </td>
+            <td style="min-width:240px">
+                {% set outcome = app.submission_status %}
+                <span style="font-weight:700;padding:1px 6px;border-radius:4px;color:#fff;
+                    background:{% if outcome == 'SUBMITTED' %}#16a34a{% elif outcome == 'DRY_RUN_VALIDATED' %}#2563eb{% elif outcome == 'SMTP_ACCEPTED' %}#7c3aed{% elif outcome in ['MANUAL_REQUIRED','SUBMISSION_FAILED'] %}#dc2626{% else %}#6b7280{% endif %}">
+                    {{ outcome or 'NOT ATTEMPTED' }}</span>
+                {% if app.submission_mode %} <small>({{ app.submission_mode }})</small>{% endif %}
+                {% if outcome == 'SMTP_ACCEPTED' %}<br><small>SMTP accepted the email — not a verified submission</small>{% endif %}
+                {% if app.submission_evidence %}<br><small>Evidence: {{ app.submission_evidence }}</small>{% endif %}
+                {% set r = app.report %}
+                {% if r and r.fields_detected is defined %}
+                <details><summary><small>Fields: {{ r.fields_detected|length }} detected ·
+                    {{ r.fields_prepared|length }} prepared · {{ r.fields_manual|length }} manual</small></summary>
+                    <small>
+                    {% if r.final_url %}Form URL: <span style="word-break:break-all">{{ r.final_url }}</span><br>{% endif %}
+                    {% for label, value in r.would_submit.items() %}✔ {{ label }}: {{ value[:80] }}<br>{% endfor %}
+                    {% for label in r.fields_manual %}<span style="color:#dc2626">✘ {{ label }} — needs manual answer</span><br>{% endfor %}
+                    {% for label in r.fields_detected if label not in r.fields_prepared and label not in r.fields_manual %}– {{ label }} (optional, left empty)<br>{% endfor %}
+                    </small>
+                </details>
+                {% endif %}
+            </td>
             <td style="min-width:200px">
                 <input type="email" id="recruiter-email-{{ app.id }}" placeholder="only if published in the posting"
                        value="{{ app.recruiter_email or '' }}"

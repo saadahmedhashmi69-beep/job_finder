@@ -14,12 +14,13 @@ as MANUAL_REQUIRED. cv_customizer's CV generation is never called.
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import logging
 import re
 from pathlib import Path
-from typing import Dict, List, Optional
-from urllib.parse import urlparse
+from typing import Callable, Dict, List, Optional
+from urllib.parse import parse_qsl, unquote, urlparse
 
 import storage
 from fixed_cv import application_dir_for_slug, resolve_fixed_cv_path
@@ -32,16 +33,33 @@ logger = logging.getLogger(__name__)
 WEB = "WEB"
 EMAIL = "EMAIL"
 
-# ATS hosts whose public application pages are plain HTML forms.
-SUPPORTED_ATS_HOSTS = {
-    "boards.greenhouse.io": "greenhouse",
-    "job-boards.greenhouse.io": "greenhouse",
-    "job-boards.eu.greenhouse.io": "greenhouse",
-    "jobs.lever.co": "lever",
-    "jobs.eu.lever.co": "lever",
-}
+# Public ATS application pages (no account needed to reach the form):
+# (route type, host regex). Marketing hosts such as www.greenhouse.io never match.
+ATS_HOST_PATTERNS = (
+    ("greenhouse", re.compile(r"^(boards|job-boards)(\.eu)?\.greenhouse\.io$")),
+    ("lever", re.compile(r"^jobs(\.eu)?\.lever\.co$")),
+    ("workable", re.compile(r"^(apply|jobs)\.workable\.com$")),
+    ("ashby", re.compile(r"^jobs\.ashbyhq\.com$")),
+    ("smartrecruiters", re.compile(r"^(jobs|careers)\.smartrecruiters\.com$")),
+    ("taleo", re.compile(r"\.taleo\.net$")),
+    ("icims", re.compile(r"\.icims\.com$")),
+    ("workday", re.compile(r"\.myworkdayjobs\.com$")),
+    ("personio", re.compile(r"\.jobs\.personio\.(de|com)$")),
+    ("teamtailor", re.compile(r"\.teamtailor\.com$")),
+    ("recruitee", re.compile(r"\.recruitee\.com$")),
+    ("bamboohr", re.compile(r"\.bamboohr\.com$")),
+    ("jobvite", re.compile(r"^jobs\.jobvite\.com$")),
+    ("successfactors", re.compile(r"\.successfactors\.(com|eu)$")),
+)
 # Boards whose apply flow needs a login / is anti-bot protected: never automated.
 LOGIN_WALLED_HOSTS = ("linkedin.com", "indeed.com", "glassdoor.", "infojobs.net")
+# Aggregators/boards: their pages are listings, not the employer's application form.
+JOB_BOARD_HOSTS = LOGIN_WALLED_HOSTS + (
+    "adzuna.", "jooble.", "google.", "stepstone.", "bayt.com", "gulftalent.com", "wuzzuf.net",
+    "himalayas.app", "remotive.com", "arbeitnow.com", "themuse.com", "talent.com",
+    "careerjet.", "trovit.", "jobatus.", "facebook.com", "twitter.com", "x.com", "instagram.com",
+)
+EMPLOYER = "employer"  # direct employer application page (non-ATS)
 
 _EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 _BAD_EMAIL = re.compile(r"(no-?reply|donotreply|@sentry|\.png$|\.jpg$)", re.I)
@@ -84,6 +102,7 @@ def candidate_facts(profile: Dict) -> Dict:
         "phone": str(profile.get("phone") or "").strip(),
         "location": location,
         "city": location.split(",")[0].strip() if location else "",
+        "country": location.split(",")[-1].strip() if "," in location else "",
         "summary": (facts.get("summary") or "").strip(),
         "linkedin": (profile.get("linkedin") or facts.get("linkedin") or "").strip(),
     }
@@ -132,7 +151,7 @@ def generate_form_answers(job: Dict, profile: Dict, category: str, cover_letter:
     anything else (salary, sponsorship, start date, languages...) is omitted."""
     f = candidate_facts(profile)
     answers = {k: f[k] for k in ("full_name", "first_name", "last_name", "email",
-                                 "phone", "location", "city", "linkedin") if f[k]}
+                                 "phone", "location", "city", "country", "linkedin") if f[k]}
     answers["cover_letter"] = cover_letter
     answers["why_interested"] = (
         f"I am applying for the {job.get('title', 'role')} role at {job.get('company', 'your company')} "
@@ -160,28 +179,165 @@ def find_application_email(job: Dict, recruiter_email: str = "") -> str:
     return posted[0] if posted else ""
 
 
-def detect_application_method(job: Dict, recruiter_email: str = "") -> Dict:
-    """Return {method: WEB|EMAIL|MANUAL_REQUIRED, ats, email, reason}."""
+def _host(url: str) -> str:
+    url = (url or "").strip()
+    return urlparse(url).netloc.lower().split(":")[0] if url.startswith(("http://", "https://")) else ""
+
+
+def ats_for_url(url: str) -> str:
+    host = _host(url)
+    return next((name for name, rx in ATS_HOST_PATTERNS if host and rx.search(host)), "")
+
+
+def is_job_board(url: str) -> bool:
+    host = _host(url)
+    return bool(host) and any(h in host for h in JOB_BOARD_HOSTS)
+
+
+def is_login_walled(url: str) -> bool:
+    host = _host(url)
+    return bool(host) and any(h in host for h in LOGIN_WALLED_HOSTS)
+
+
+def normalize_application_url(url: str, ats: str) -> str:
+    """Point ATS posting URLs at the page that actually holds the form."""
+    base = url.split("#")[0]
+    path = urlparse(base).path.rstrip("/")
+    if ats == "lever" and not path.endswith("/apply"):
+        return base.split("?")[0].rstrip("/") + "/apply"
+    if ats == "workable" and "/j/" in path and not path.endswith("/apply"):
+        return base.split("?")[0].rstrip("/") + "/apply/"
+    if ats == "ashby" and path.count("/") >= 2 and not path.endswith("/application"):
+        return base.split("?")[0].rstrip("/") + "/application"
+    return base
+
+
+_URL_RE = re.compile(r"https?://[^\s\"'<>()\[\]{}|\\^`]+", re.I)
+_REDIRECT_PARAMS = ("url", "u", "dest", "destination", "redirect", "redirect_url", "redirecturl",
+                    "target", "applyurl", "apply_url", "to", "link")
+_APPLY_PATH = re.compile(r"apply|application|aplicar|candidat|inscri|careers?|/jobs?/|empleo|"
+                         r"trabaja|vacante|oferta|job-?offer|recruit|solicitud", re.I)
+# Board links that redirect to the employer's site ("apply on company website").
+_BOARD_APPLY_REDIRECT = re.compile(r"/(applystart|rc/clk|pagead/clk|jobs/view/externalApply)", re.I)
+_ASSET = re.compile(r"\.(png|jpe?g|gif|svg|css|js|ico|woff2?|webp)(\?|$)", re.I)
+
+
+def _unwrap(url: str, depth: int = 3) -> str:
+    """Follow redirect wrappers like ...?url=https%3A%2F%2Femployer... (no network)."""
+    url = html.unescape(url or "").strip().rstrip(".,;:'\"")
+    for _ in range(depth):
+        params = {k.lower(): v for k, v in parse_qsl(urlparse(url).query)}
+        nxt = next((unquote(params[k]) for k in _REDIRECT_PARAMS
+                    if unquote(params.get(k, "")).lower().startswith(("http://", "https://"))), "")
+        if not nxt:
+            break
+        url = nxt
+    return url
+
+
+def _routes_in_text(text: str, source: str, *, employer_ok: bool) -> List[Dict]:
+    """ATS (and optionally employer apply) URLs found in text/HTML, ATS first."""
+    ats_routes, employer_routes, seen = [], [], set()
+    for raw in _URL_RE.findall(html.unescape(text or "")):
+        url = _unwrap(raw)
+        if url in seen or not _host(url) or _ASSET.search(url):
+            continue
+        seen.add(url)
+        ats = ats_for_url(url)
+        if ats:
+            ats_routes.append({"route_type": ats, "url": normalize_application_url(url, ats), "source": source})
+        elif employer_ok and not is_job_board(url) and _APPLY_PATH.search(urlparse(url).path):
+            employer_routes.append({"route_type": EMPLOYER, "url": url, "source": source})
+    return ats_routes + employer_routes
+
+
+def _http_fetch(url: str):
+    """GET a public page (follows public redirects). Returns (final_url, html) or None.
+    No cookies, no login, no anti-bot workarounds: a blocked page just yields None."""
+    try:
+        import requests
+        resp = requests.get(url, timeout=12, allow_redirects=True, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            "Accept-Language": "es-ES,es;q=0.9,en;q=0.8"})
+        if resp.status_code != 200:
+            return None
+        return resp.url, resp.text
+    except Exception as e:  # network errors: route stays undiscovered
+        logger.info("Route discovery fetch failed for %s: %s", url, e)
+        return None
+
+
+def _route(url: str, source: str, reason: str) -> Dict:
+    ats = ats_for_url(url)
+    return {"route_type": ats or EMPLOYER, "url": normalize_application_url(url, ats),
+            "source": source, "reason": reason.format(kind=ats or "employer")}
+
+
+def discover_application_route(job: Dict, fetch: Optional[Callable] = None) -> Dict:
+    """Find where the application form actually lives.
+
+    Order: job URL on a public ATS -> apply URL stored from the board -> ATS /
+    employer apply links in the description -> (board postings only, when
+    `fetch` is given) the public job page: a redirect off the board, ATS links
+    in it, or the board's "apply on company site" redirect link.
+    Never logs in or bypasses walls. Returns {route_type, url, source, reason};
+    route_type/url are "" when no public route exists.
+    """
+    job_url = (job.get("url") or "").strip()
+    if ats_for_url(job_url):
+        return _route(job_url, "job_url", "{kind} ATS form")
+    apply_url = _unwrap(job.get("apply_url") or "")
+    if _host(apply_url) and not is_job_board(apply_url):
+        return _route(apply_url, "apply_url", "{kind} application URL exposed by the board")
+    routes = _routes_in_text(job.get("description") or "", "description", employer_ok=True)
+    if routes:
+        return {**routes[0], "reason": f"{routes[0]['route_type']} application URL in the posting"}
+    if fetch and is_job_board(job_url):
+        page = fetch(job_url)
+        if page:
+            final_url, page_html = page
+            if _host(final_url) and not is_job_board(final_url):
+                return _route(final_url, "job_page_redirect", "Board posting redirects to the {kind} page")
+            routes = _routes_in_text(page_html, "job_page", employer_ok=False)
+            if routes:
+                return {**routes[0], "reason": f"{routes[0]['route_type']} application URL on the public job page"}
+            for raw in _URL_RE.findall(html.unescape(page_html or "")):
+                if is_job_board(raw) and _BOARD_APPLY_REDIRECT.search(raw):
+                    resolved = fetch(raw)
+                    if resolved and _host(resolved[0]) and not is_job_board(resolved[0]):
+                        return _route(resolved[0], "apply_redirect",
+                                      "Board 'apply on company site' link resolves to the {kind} page")
+    return {"route_type": "", "url": "", "source": "", "reason": ""}
+
+
+def detect_application_method(job: Dict, recruiter_email: str = "", fetch: Optional[Callable] = None) -> Dict:
+    """Return {method: WEB|EMAIL|MANUAL_REQUIRED, ats, route_type, url, source, email, reason}.
+
+    `fetch` (url -> (final_url, html) | None) enables looking inside job-board
+    postings; without it no network is used.
+    """
     url = (job.get("url") or "").strip()
-    host = urlparse(url).netloc.lower() if url.startswith(("http://", "https://")) else ""
     email = find_application_email(job, recruiter_email)
-    ats = SUPPORTED_ATS_HOSTS.get(host, "")
-    if ats:
-        return {"method": WEB, "ats": ats, "email": email, "reason": f"{ats} ATS form"}
+    route = discover_application_route(job, fetch=fetch)
+    if route["url"]:
+        return {"method": WEB, "ats": route["route_type"], "email": email, **route}
     if email:
-        return {"method": EMAIL, "ats": "", "email": email, "reason": "Application email in posting"}
-    if host and not any(h in host for h in LOGIN_WALLED_HOSTS):
-        return {"method": WEB, "ats": "generic", "email": "",
-                "reason": "Generic web form (attempted; stops as MANUAL_REQUIRED if unsupported)"}
-    return {"method": MANUAL_REQUIRED, "ats": "", "email": "",
-            "reason": ("Apply flow on a login-walled board (LinkedIn/Indeed/...) and no application email"
-                       if host else "No application URL or email")}
+        return {"method": EMAIL, "ats": "", "route_type": "email", "url": "", "source": "description",
+                "email": email, "reason": "Application email in posting"}
+    if _host(url) and not is_job_board(url):
+        return {"method": WEB, "ats": "generic", "route_type": EMPLOYER, "url": url, "source": "job_url",
+                "email": "", "reason": "Generic web form (attempted; stops as MANUAL_REQUIRED if unsupported)"}
+    return {"method": MANUAL_REQUIRED, "ats": "", "route_type": "", "url": "", "source": "", "email": "",
+            "reason": ("No public application route: the job-board posting (LinkedIn/Indeed/...) exposes no "
+                       "employer/ATS application URL and no application email" if _host(url)
+                       else "No application URL or email")}
 
 
 # --- Preparation -------------------------------------------------------------
 
 def prepare_application(job: Dict, profile: Dict, *, matcher=None,
-                        db_path: Optional[Path] = None) -> Dict:
+                        db_path: Optional[Path] = None, fetch: Optional[Callable] = None) -> Dict:
     """Qualify a job and, only if QUALIFIED, prepare its application package.
 
     Returns {"status", "app_id", "reasons", "method"}; status is the job's
@@ -222,12 +378,37 @@ def prepare_application(job: Dict, profile: Dict, *, matcher=None,
         email_body=letter,
     )
 
-    method = detect_application_method(job)
+    method = detect_application_method(job, fetch=fetch or _http_fetch)
     status = MANUAL_REQUIRED if method["method"] == MANUAL_REQUIRED else READY_TO_SUBMIT
     storage.update_application(
         app_id, db_path=db, status=status, application_method=method["method"],
         recruiter_email=method["email"], status_reason=method["reason"],
+        application_url=method["url"], route_type=method["route_type"], route_source=method["source"],
     )
     logger.info("Prepared application #%s (%s, %s) for %s at %s", app_id, status,
                 method["method"], job.get("title"), job.get("company"))
     return {"status": status, "app_id": app_id, "reasons": [method["reason"]], "method": method["method"]}
+
+
+def reroute_manual_applications(db_path: Optional[Path] = None, fetch: Optional[Callable] = None) -> int:
+    """Re-run route discovery for QUALIFIED jobs whose application is MANUAL_REQUIRED
+    only because no route was known. A found route makes it READY_TO_SUBMIT.
+    Nothing is submitted. Returns the number of applications re-routed."""
+    db = _db(db_path)
+    conn = storage.get_db(db)
+    rows = [dict(r) for r in conn.execute(
+        """SELECT j.*, a.id AS app_id FROM applications a JOIN jobs j ON a.job_url = j.url
+           WHERE a.status = ? AND a.application_method = ? AND j.qualification_status = ?""",
+        (MANUAL_REQUIRED, MANUAL_REQUIRED, QUALIFIED))]
+    conn.close()
+    rerouted = 0
+    for row in rows:
+        method = detect_application_method(row, fetch=fetch or _http_fetch)
+        if method["method"] == MANUAL_REQUIRED:
+            continue
+        storage.update_application(
+            row["app_id"], db_path=db, status=READY_TO_SUBMIT, application_method=method["method"],
+            recruiter_email=method["email"], status_reason=method["reason"],
+            application_url=method["url"], route_type=method["route_type"], route_source=method["source"])
+        rerouted += 1
+    return rerouted

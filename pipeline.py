@@ -211,6 +211,16 @@ def run_pipeline(
 
         if qual_counts:
             log_lines.append(f"Qualification/application outcomes: {qual_counts}")
+        if not dry_run and not _shutdown:
+            # Earlier route-less MANUAL_REQUIRED applications: look for a public
+            # employer/ATS route again (discovery only; nothing is submitted).
+            try:
+                from application_prep import reroute_manual_applications
+                rerouted = reroute_manual_applications()
+                if rerouted:
+                    log_lines.append(f"Re-routed {rerouted} MANUAL_REQUIRED application(s) to READY_TO_SUBMIT")
+            except Exception as e:
+                logger.error("Route re-discovery failed: %s", e)
 
         # --- Step 4: Send email digest ---
         logger.info("=== Pipeline Step 4: Email digest ===")

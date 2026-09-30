@@ -91,6 +91,8 @@ def _df_to_jobs(df, board: JobBoard) -> list[Job]:
             date_posted=_clean(row.get("date_posted")),
             job_type=_clean(row.get("job_type")),
             is_remote=bool(row.get("is_remote")),
+            # Employer/ATS URL behind the board's "apply on company site" button.
+            apply_url=_clean(row.get("job_url_direct")),
         ))
     logger.info(f"  JobSpy {board.value}: {len(jobs)} jobs found")
     return jobs

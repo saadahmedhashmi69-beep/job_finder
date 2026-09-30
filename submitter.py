@@ -49,8 +49,11 @@ def get_submission_mode(profile: Optional[Dict]) -> str:
 
 # --- Page inspection ---------------------------------------------------------
 
-_CAPTCHA = re.compile(r"g-recaptcha|recaptcha/api|hcaptcha|cf-turnstile|captcha", re.I)
-_LOGIN_URL = re.compile(r"/(login|signin|sign-in|authwall|auth|account/login)\b", re.I)
+_CAPTCHA = re.compile(r"g-recaptcha|recaptcha/api|hcaptcha|cf-turnstile|captcha|challenges\.cloudflare\.com", re.I)
+_LOGIN_URL = re.compile(r"/(login|signin|sign-in|authwall|auth|account/login|uas/login)\b", re.I)
+_LOGIN_TEXT = re.compile(
+    r"sign in to apply|log ?in to apply|create an account to apply|sign in to continue|"
+    r"inicia sesi[oó]n para (aplicar|inscribirte|postular|continuar)|reg[ií]strate para (aplicar|inscribirte)", re.I)
 _CONFIRM_TEXT = re.compile(
     r"thank you for (applying|your application)|application (has been )?(received|submitted)|"
     r"we have received your application|gracias por (tu|su) (candidatura|solicitud|inter[eé]s)|"
@@ -58,20 +61,36 @@ _CONFIRM_TEXT = re.compile(
 _CONFIRM_URL = re.compile(r"/(thanks|thank-you|thank_you|confirmation|confirm|success|submitted)\b", re.I)
 _APPLICATION_ID = re.compile(r"(application|candidatura|solicitud) (id|number|n[uú]mero|ref(erence)?)\s*[:#]?\s*[A-Z0-9-]{4,}", re.I)
 
-# JS: describe every visible form control and tag it with data-jf-idx.
+# JS: describe every form control and tag it (and its form) with data-jf-* ids.
 _FIELDS_JS = r"""
-() => Array.from(document.querySelectorAll('input, textarea, select')).map((el, i) => {
-  el.setAttribute('data-jf-idx', String(i));
-  const lab = (el.id && document.querySelector(`label[for="${el.id}"]`)) || el.closest('label');
-  return {
-    idx: i, tag: el.tagName.toLowerCase(), type: (el.type || '').toLowerCase(),
-    name: el.name || '', id: el.id || '', placeholder: el.placeholder || '',
-    aria: el.getAttribute('aria-label') || '', label: lab ? lab.innerText : '',
-    required: el.required || el.getAttribute('aria-required') === 'true',
-    value: el.value || '', hidden: el.type === 'hidden' || el.offsetParent === null,
-  };
-})
+() => {
+  Array.from(document.forms).forEach((f, i) => f.setAttribute('data-jf-form', String(i)));
+  return Array.from(document.querySelectorAll('input, textarea, select')).map((el, i) => {
+    el.setAttribute('data-jf-idx', String(i));
+    const lab = (el.id && document.querySelector(`label[for="${el.id}"]`)) || el.closest('label');
+    const label = lab ? lab.innerText : '';
+    return {
+      idx: i, tag: el.tagName.toLowerCase(), type: (el.type || '').toLowerCase(),
+      name: el.name || '', id: el.id || '', placeholder: el.placeholder || '',
+      aria: el.getAttribute('aria-label') || '', label: label,
+      role: el.getAttribute('role') || '',
+      required: el.required || el.getAttribute('aria-required') === 'true' || /\*\s*$/.test(label.trim()),
+      value: el.value || '', checked: !!el.checked,
+      options: el.tagName === 'SELECT' ? Array.from(el.options).map(o => o.text.trim()) : [],
+      form: el.form ? Number(el.form.getAttribute('data-jf-form')) : -1,
+      hidden: el.type === 'hidden' || (el.offsetParent === null && el.type !== 'file'),
+    };
+  });
+}
 """
+# JS: links on the page (to follow an "Apply" link to the actual form).
+_LINKS_JS = r"""
+() => Array.from(document.querySelectorAll('a[href]')).map(a => ({
+  href: a.href, text: (a.innerText || a.getAttribute('aria-label') || '').trim().slice(0, 80)}))
+"""
+_APPLY_LINK_TEXT = re.compile(
+    r"^\s*(apply|apply now|apply for this (job|position|role)|apply here|aplicar|aplica ya|solicitar|"
+    r"inscr[ií]bete|inscribirme|postular(me)?|enviar (mi )?candidatura|candid[aá]tate|quiero aplicar)\b", re.I)
 
 # (answer key, regex over the field's name/id/label/placeholder text)
 _FIELD_MAP = [
@@ -81,105 +100,221 @@ _FIELD_MAP = [
     ("email", r"e-?mail|correo"),
     ("phone", r"phone|mobile|tel[eé]fono|m[oó]vil"),
     ("city", r"\bcity\b|ciudad|localidad"),
-    ("location", r"location|address|ubicaci[oó]n|direcci[oó]n"),
+    ("country", r"\bcountry\b|pa[ií]s"),
+    ("location", r"location|ubicaci[oó]n|where are you based"),
     ("linkedin", r"linkedin"),
     ("cover_letter", r"cover.?letter|carta de presentaci[oó]n|motivation"),
     ("why_interested", r"why .*(interested|apply|join)|por qu[eé]"),
 ]
+# Fields about someone/something else (a referee, an employer...) are never
+# answered with the candidate's own details.
+_NOT_ABOUT_CANDIDATE = re.compile(
+    r"company|empresa|employer|referen|referee|emergency|recruiter|hiring manager|school|"
+    r"universi|colegio|salary|salario|sueldo|visa|permit|permiso|sponsor|notice|start date|"
+    r"incorporaci|disponibilidad|years|a[nñ]os|gender|g[eé]nero|ethnic|race|disab|veteran", re.I)
+_SPAIN_NAMES = {"spain", "españa", "espana"}
+_TEXT_TYPES = ("text", "email", "tel", "url", "")
+_CLICKABLE = ("submit", "button", "reset", "image")
 
 
 def _field_text(f: Dict) -> str:
     return " ".join(str(f.get(k, "")) for k in ("name", "id", "label", "placeholder", "aria")).lower().strip()
 
 
+def _field_label(f: Dict) -> str:
+    for k in ("label", "aria", "placeholder", "name", "id"):
+        v = re.sub(r"\s+", " ", str(f.get(k) or "")).strip()
+        if v:
+            return v[:80]
+    return f"field #{f['idx']}"
+
+
 def _selector(f: Dict) -> str:
     return f'[data-jf-idx="{f["idx"]}"]'
 
 
-def fill_application_form(page, url: str, answers: Dict[str, str], cv_path: Path,
-                          mode: str = DRY_RUN) -> Dict:
-    """Drive one application form on a Playwright-like `page`.
+def _answer_key(f: Dict) -> Optional[str]:
+    text = _field_text(f)
+    if _NOT_ABOUT_CANDIDATE.search(text):
+        return None
+    return next((k for k, rx in _FIELD_MAP if re.search(rx, text)), None)
 
-    Returns {"status", "reason", "filled", "missing_required", "evidence"}.
-    """
-    result = {"status": MANUAL_REQUIRED, "reason": "", "filled": [], "missing_required": [], "evidence": ""}
-    page.goto(url)
+
+def _blocked_reason(page) -> str:
+    """CAPTCHA / login wall on the current page ('' when the page is public)."""
     html = page.content() or ""
     if _CAPTCHA.search(html):
-        result["reason"] = "CAPTCHA detected - manual application required"
-        return result
-    if _LOGIN_URL.search(page.url or "") or re.search(r'type=["\']password', html, re.I):
-        result["reason"] = "Login required - manual application required"
-        return result
+        return "CAPTCHA detected - manual application required (never bypassed)"
+    if (_LOGIN_URL.search(page.url or "") or re.search(r'type=["\']?password', html, re.I)
+            or _LOGIN_TEXT.search(re.sub(r"<[^>]+>", " ", html))):
+        return "Login required - manual application required (authentication never bypassed)"
+    return ""
 
-    fields = [f for f in (page.evaluate(_FIELDS_JS) or []) if not f.get("hidden") or f.get("type") == "file"]
+
+def _visible_fields(page) -> List[Dict]:
+    return [f for f in (page.evaluate(_FIELDS_JS) or [])
+            if isinstance(f, dict) and "idx" in f and f.get("type") not in _CLICKABLE
+            and (not f.get("hidden") or f.get("type") == "file")]
+
+
+def _apply_link(page, visited: List[str]) -> str:
+    """A public 'Apply' link on the page (never a login-walled board or login page)."""
+    from application_prep import is_login_walled
+    for link in page.evaluate(_LINKS_JS) or []:
+        if not isinstance(link, dict):
+            continue
+        href = link.get("href") or ""
+        if (not href.startswith(("http://", "https://")) or href in visited or is_login_walled(href)
+                or _LOGIN_URL.search(href)):
+            continue
+        if _APPLY_LINK_TEXT.search(link.get("text") or "") or re.search(r"/apply/?(\?|$)|/application/?(\?|$)", href):
+            return href
+    return ""
+
+
+def _goto(page, url: str):
+    page.goto(url)
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
+
+
+def fill_application_form(page, url: str, answers: Dict[str, str], cv_path: Path,
+                          mode: str = DRY_RUN, cv_sha256: str = "") -> Dict:
+    """Drive one public application form on a Playwright-like `page`.
+
+    Opens `url` (following at most two public "Apply" links to reach the form),
+    stops on CAPTCHA/login walls, uploads the fixed CV, fills only fields that
+    map to truthful profile answers and reports everything else. The final
+    submit button is clicked only in LIVE mode, after re-checking the CV hash.
+
+    Returns {"status", "reason", "filled", "missing_required", "evidence", "report"}.
+    """
+    report = {"route_url": url, "final_url": "", "navigated": [], "fields_detected": [],
+              "fields_prepared": {}, "fields_manual": [], "would_submit": {}, "cv_uploaded": ""}
+    result = {"status": MANUAL_REQUIRED, "reason": "", "filled": [], "missing_required": [],
+              "evidence": "", "report": report}
+
+    _goto(page, url)
+    fields: List[Dict] = []
+    for hop in range(3):
+        blocked = _blocked_reason(page)
+        if blocked:
+            result["reason"] = blocked
+            report["final_url"] = page.url
+            return result
+        fields = _visible_fields(page)
+        if any(f["type"] == "file" for f in fields) or hop == 2:
+            break
+        link = _apply_link(page, [url] + report["navigated"])
+        if not link:
+            break
+        report["navigated"].append(link)
+        _goto(page, link)
+    report["final_url"] = page.url
+
     if not fields:
         result["reason"] = "No application form found on page"
         return result
 
-    cv_uploaded = False
-    for f in fields:
-        text = _field_text(f)
-        if f["type"] == "file":
-            if re.search(r"resume|cv|curr[ií]cul", text) or not cv_uploaded:
-                if re.search(r"cover", text):
-                    continue  # cover letter goes into its text field, not as a file
-                page.set_input_files(_selector(f), str(cv_path))
-                cv_uploaded = True
-                result["filled"].append("cv_upload")
-            continue
-        if f["type"] in ("submit", "button", "checkbox", "radio", "hidden") or f["tag"] == "select":
-            continue
-        key = next((k for k, rx in _FIELD_MAP if re.search(rx, text)), None)
-        value = answers.get(key) if key else None
-        if key == "cover_letter" and f["tag"] != "textarea" and f["type"] not in ("text", ""):
-            value = None
-        if value:
-            page.fill(_selector(f), str(value))
-            f["value"] = str(value)
-            result["filled"].append(key)
+    # Restrict to the form holding the CV upload (not a newsletter/search form).
+    cv_field = next((f for f in fields if f["type"] == "file" and re.search(r"resume|cv|curr[ií]cul", _field_text(f))),
+                    next((f for f in fields if f["type"] == "file" and not re.search(r"cover", _field_text(f))), None))
+    form_id = cv_field.get("form", -1) if cv_field else -1
+    if form_id not in (-1, None):
+        fields = [f for f in fields if f.get("form", -1) == form_id]
 
+    manual, seen_groups = report["fields_manual"], set()
     for f in fields:
-        if f.get("required") and not f.get("value") and f["type"] != "file" and f["type"] not in ("submit", "button"):
-            result["missing_required"].append(_field_text(f) or f"field #{f['idx']}")
-        if f.get("required") and f["type"] == "file" and not cv_uploaded:
-            result["missing_required"].append("cv upload")
-    if not cv_uploaded:
+        label = _field_label(f)
+        report["fields_detected"].append(label)
+        ftype, required = f["type"], bool(f.get("required"))
+        if f is cv_field:
+            page.set_input_files(_selector(f), str(cv_path))
+            report["cv_uploaded"] = str(cv_path)
+            report["fields_prepared"][label] = "cv_upload"
+            report["would_submit"][label] = Path(cv_path).name
+            result["filled"].append("cv_upload")
+            continue
+        if ftype in ("checkbox", "radio"):
+            # Consents, yes/no questions, demographics: never answered automatically.
+            group = f.get("name") or label
+            if required and not f.get("checked") and group not in seen_groups:
+                manual.append(label)
+            seen_groups.add(group)
+            continue
+        key = _answer_key(f)
+        value = answers.get(key) if key else None
+        if ftype == "file" or f.get("role") == "combobox":
+            value = None  # other uploads / custom widgets: left for a human
+        elif f["tag"] == "select":
+            if value:
+                wanted = {str(value).lower()}
+                if wanted & _SPAIN_NAMES:
+                    wanted |= _SPAIN_NAMES
+                value = next((o for o in f.get("options") or [] if o.lower() in wanted), None)
+                if value:
+                    page.select_option(_selector(f), label=value)
+        elif ftype not in _TEXT_TYPES and f["tag"] != "textarea":
+            value = None  # number/date/etc.: nothing in the profile answers them truthfully
+        elif key == "cover_letter" and f["tag"] != "textarea" and ftype != "text":
+            value = None
+        elif value:
+            page.fill(_selector(f), str(value))
+        if value:
+            f["value"] = str(value)
+            report["fields_prepared"][label] = key
+            report["would_submit"][label] = str(value)[:160]
+            result["filled"].append(key)
+        elif required and not f.get("value"):
+            manual.append(label)
+
+    result["missing_required"] = list(manual)
+    if not cv_field:
         result["reason"] = "No CV upload field found - manual application required"
         return result
-    if result["missing_required"]:
-        result["reason"] = ("Required fields without a truthful profile answer: "
-                            + "; ".join(result["missing_required"][:8]))
+    if manual:
+        result["reason"] = "Required fields without a truthful profile answer: " + "; ".join(manual[:8])
         return result
 
     if mode != LIVE:
         result["status"] = DRY_RUN_VALIDATED
-        result["reason"] = "DRY_RUN: form filled and CV uploaded; submit NOT clicked"
+        result["reason"] = (f"DRY_RUN: {len(report['fields_prepared'])} fields filled incl. fixed CV; "
+                            f"final submit NOT clicked")
         return result
 
-    submit = page.query_selector('button[type="submit"], input[type="submit"]')
+    if cv_sha256 and sha256_file(cv_path) != cv_sha256:
+        result["reason"] = "Fixed CV checksum changed before submit - not submitted"
+        return result
+    scope = f'[data-jf-form="{form_id}"] ' if form_id not in (-1, None) else ""
+    submit = page.query_selector(f'{scope}button[type="submit"], {scope}input[type="submit"]')
     if not submit:
         result["reason"] = "No submit button found - manual application required"
         return result
+    before_html, before_url = page.content() or "", page.url
     submit.click()
     try:
         page.wait_for_load_state("networkidle", timeout=20000)
     except Exception:
         pass
-    return {**result, **verify_submission(page)}
+    report["final_url"] = page.url
+    return {**result, **verify_submission(page, before_html=before_html, before_url=before_url)}
 
 
-def verify_submission(page) -> Dict:
-    """SUBMITTED only with observable confirmation; otherwise SUBMISSION_FAILED."""
+def verify_submission(page, before_html: str = "", before_url: str = "") -> Dict:
+    """SUBMITTED only with observable confirmation that was not on the page
+    before submitting; otherwise SUBMISSION_FAILED (or MANUAL_REQUIRED)."""
     html = page.content() or ""
     text = re.sub(r"<[^>]+>", " ", html)
-    if _CAPTCHA.search(html):
+    before_text = re.sub(r"<[^>]+>", " ", before_html or "")
+    if _CAPTCHA.search(html) and not _CAPTCHA.search(before_html or ""):
         return {"status": MANUAL_REQUIRED, "reason": "CAPTCHA shown after submit", "evidence": ""}
     for rx, label in ((_CONFIRM_TEXT, "confirmation text"), (_APPLICATION_ID, "application id")):
         m = rx.search(text)
-        if m:
+        if m and not rx.search(before_text):
             return {"status": SUBMITTED, "reason": f"Confirmed by {label}", "evidence": m.group(0)[:200]}
-    if _CONFIRM_URL.search(page.url or ""):
+    if (page.url or "") != (before_url or "") and _CONFIRM_URL.search(page.url or ""):
         return {"status": SUBMITTED, "reason": "Confirmed by success redirect", "evidence": page.url}
     return {"status": SUBMISSION_FAILED, "reason": "Submit clicked but no confirmation observed", "evidence": ""}
 
@@ -221,25 +356,35 @@ def submit_application(app_id: int, profile: Dict, *, mode: Optional[str] = None
     if app["status"] != READY_TO_SUBMIT:
         return {"status": app["status"], "reason": f"Not READY_TO_SUBMIT (status {app['status']})"}
 
+    # Fixed CV only: exact configured file, SHA-256 must match the one recorded at preparation.
     cv_path = resolve_fixed_cv_path(profile)
-    if Path(app["cv_pdf_path"]).resolve() != cv_path or (
-            app.get("cv_sha256") and sha256_file(cv_path) != app["cv_sha256"]):
+    if (Path(app["cv_pdf_path"] or "").resolve() != cv_path or not app.get("cv_sha256")
+            or sha256_file(cv_path) != app["cv_sha256"]):
         return _record(app_id, db, mode, MANUAL_REQUIRED, "Fixed CV path/checksum mismatch")
     answers = json.loads(app.get("form_answers_json") or "{}")
 
     if app.get("application_method") == WEB:
+        from application_prep import is_login_walled
+        route_url = app.get("application_url") or app["url"]
+        report = {"route_url": route_url, "route_type": app.get("route_type") or ""}
+        if is_login_walled(route_url):
+            return _record(app_id, db, mode, MANUAL_REQUIRED,
+                           "Application route is a login-walled job board - not automated", report=report)
         try:
             page, close = (page_factory() if page_factory else _open_browser_page())
         except ImportError:
             return _record(app_id, db, mode, MANUAL_REQUIRED,
-                           "Playwright not installed (pip install playwright; playwright install chromium)")
+                           "Playwright not installed (pip install playwright; playwright install chromium)",
+                           report=report)
         try:
-            res = fill_application_form(page, app["url"], answers, cv_path, mode=mode)
+            res = fill_application_form(page, route_url, answers, cv_path, mode=mode,
+                                        cv_sha256=app["cv_sha256"])
         except Exception as e:
             res = {"status": MANUAL_REQUIRED, "reason": f"Browser automation stopped: {e}", "evidence": ""}
         finally:
             close()
-        return _record(app_id, db, mode, res["status"], res["reason"], res.get("evidence", ""))
+        report.update(res.get("report") or {})
+        return _record(app_id, db, mode, res["status"], res["reason"], res.get("evidence", ""), report=report)
 
     if app.get("application_method") == EMAIL:
         to = find_application_email(app, app.get("recruiter_email") or "")
@@ -261,10 +406,15 @@ def submit_application(app_id: int, profile: Dict, *, mode: Optional[str] = None
     return _record(app_id, db, mode, MANUAL_REQUIRED, "No supported application method")
 
 
-def _record(app_id: int, db: Path, mode: str, outcome: str, reason: str, evidence: str = "") -> Dict:
+def _record(app_id: int, db: Path, mode: str, outcome: str, reason: str, evidence: str = "",
+            report: Optional[Dict] = None) -> Dict:
     """Persist the outcome. DRY_RUN keeps the application READY_TO_SUBMIT."""
+    if outcome == SUBMITTED and not evidence:
+        outcome, reason = SUBMISSION_FAILED, f"{reason} (no observable evidence)"
     fields = {"submission_mode": mode, "submission_status": outcome, "status_reason": reason,
               "submission_evidence": evidence}
+    if report is not None:
+        fields["submission_report_json"] = json.dumps(report)
     if outcome != DRY_RUN_VALIDATED:
         fields["status"] = outcome
     if outcome == SUBMITTED:
@@ -278,7 +428,7 @@ def _record(app_id: int, db: Path, mode: str, outcome: str, reason: str, evidenc
                      (app_id,))
         conn.commit()
         conn.close()
-    return {"status": outcome, "reason": reason, "evidence": evidence, "mode": mode}
+    return {"status": outcome, "reason": reason, "evidence": evidence, "mode": mode, "report": report or {}}
 
 
 # --- Verified-submission contract ---------------------------------------------

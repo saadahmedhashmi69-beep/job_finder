@@ -351,6 +351,11 @@ def create_app():
                 a["qual_reasons"] = json.loads(a.get("qualification_reasons") or "[]")
             except (TypeError, ValueError):
                 a["qual_reasons"] = []
+        for a in apps:
+            try:
+                a["report"] = json.loads(a.get("submission_report_json") or "{}")
+            except (TypeError, ValueError):
+                a["report"] = {}
         from submitter import get_submission_mode
         return render_template("applications.html", applications=apps, review_jobs=review,
                                legacy_hidden=len(all_apps) - len(apps),

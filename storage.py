@@ -69,6 +69,11 @@ def get_db(db_path: Path = DB_PATH) -> sqlite3.Connection:
             "cv_sha256": "TEXT DEFAULT ''",
             "submitted_at": "TEXT DEFAULT ''",
             "submission_evidence": "TEXT DEFAULT ''",
+            # Application route (see application_prep.discover_application_route).
+            "application_url": "TEXT DEFAULT ''",
+            "route_type": "TEXT DEFAULT ''",
+            "route_source": "TEXT DEFAULT ''",
+            "submission_report_json": "TEXT DEFAULT '{}'",
         },
     )
     _ensure_columns(
@@ -79,6 +84,7 @@ def get_db(db_path: Path = DB_PATH) -> sqlite3.Connection:
             "qualification_category": "TEXT DEFAULT ''",
             "qualification_reasons": "TEXT DEFAULT '[]'",
             "qualified_at": "TEXT DEFAULT ''",
+            "apply_url": "TEXT DEFAULT ''",
         },
     )
     if _ensure_columns(conn, "jobs", {"is_remote": "INTEGER DEFAULT 0"}):
@@ -357,13 +363,14 @@ def save_jobs(jobs: List[Job], db_path: Path = DB_PATH) -> int:
                 """INSERT OR IGNORE INTO jobs
                    (url, title, company, location, board, description,
                     salary, date_posted, job_type, is_remote, scraped_at,
-                    match_score, match_details)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    match_score, match_details, apply_url)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     job.url, job.title, job.company, job.location,
                     job.board.value, job.description, job.salary,
                     job.date_posted, job.job_type, 1 if job.is_remote else 0,
                     job.scraped_at, job.match_score, json.dumps(job.match_details),
+                    job.apply_url,
                 ),
             )
             seen_fingerprints.add(fingerprint)

@@ -78,7 +78,12 @@ class FakePage:
         return self._html
 
     def evaluate(self, js):
+        if js == submitter._LINKS_JS:
+            return []
         return [dict(f, idx=i) for i, f in enumerate(self.fields)]
+
+    def select_option(self, selector, label=None):
+        self.filled[selector] = label
 
     def fill(self, selector, value):
         self.filled[selector] = value
@@ -133,7 +138,9 @@ class WorkflowBase(unittest.TestCase):
                   mock.patch.object(cv_customizer, "customize_cv_for_job", side_effect=_forbid),
                   mock.patch.object(cv_customizer, "compile_latex", side_effect=_forbid),
                   mock.patch.object(cv_customizer, "analyze_job", side_effect=_forbid),
-                  mock.patch("smtplib.SMTP_SSL", side_effect=AssertionError("real SMTP used"))):
+                  mock.patch("smtplib.SMTP_SSL", side_effect=AssertionError("real SMTP used")),
+                  # Route discovery never reaches the network in tests.
+                  mock.patch.object(application_prep, "_http_fetch", return_value=None)):
             p.start()
             self.addCleanup(p.stop)
         self.m = matcher.JobMatcher(self.profile)
