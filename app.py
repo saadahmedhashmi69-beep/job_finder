@@ -542,7 +542,9 @@ def create_app():
                 result = submit_application(int(app_id), profile, interactive=False)
             except Exception as e:
                 return jsonify({"status": "error", "error": str(e)}), 400
-            sent = result.get("status") in (SMTP_ACCEPTED, SUBMITTED)
+            # Only an attempt made by THIS call carries "recorded"; a duplicate gate
+            # returns the earlier status (e.g. SMTP_ACCEPTED) without sending anything.
+            sent = result.get("status") in (SMTP_ACCEPTED, SUBMITTED) and "recorded" in result
             return jsonify({"status": "ok" if sent else "error", "sent": sent, "result": result,
                             "error": "" if sent else f"{result.get('status')}: {result.get('reason')}"}), \
                 (200 if sent else 400)

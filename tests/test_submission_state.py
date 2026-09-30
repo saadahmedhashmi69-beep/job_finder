@@ -224,7 +224,7 @@ class TestRecipientGuards(StateBase):
         second, sender = self.second_app_same_recipient(), mock.Mock(return_value=SENT_OK)
         self.assertEqual(self.submit(second, sender)["status"], SMTP_ACCEPTED)
 
-    def test_ui_cannot_rewrite_the_recipient_of_a_sent_application(self):
+    def client(self):
         import app as app_module
         for p in (mock.patch.object(storage, "DB_PATH", self.db),
                   mock.patch.object(app_module, "get_db", side_effect=lambda *a, **k: storage.get_db(self.db)),
@@ -232,7 +232,26 @@ class TestRecipientGuards(StateBase):
                   mock.patch.object(app_module, "load_profile", return_value=self.profile)):
             p.start()
             self.addCleanup(p.stop)
-        client = app_module.create_app().test_client()
+        return app_module.create_app().test_client()
+
+    def test_ui_approve_send_never_reports_a_blocked_duplicate_as_sent(self):
+        client = self.client()
+        sent, ready = self.email_app(0), self.email_app(1)
+        self.set_app(sent, **ID16_STATE)
+        sender = mock.Mock(return_value=SENT_OK)
+        with mock.patch("applier.send_application_email_detailed", sender):
+            resp = client.post("/api/application/approve-send", json={"app_id": sent, "confirm": True})
+            self.assertEqual(resp.status_code, 400)
+            self.assertIs(resp.get_json()["sent"], False)
+            self.assertIn("duplicate", resp.get_json()["error"].lower())
+            sender.assert_not_called()
+            resp = client.post("/api/application/approve-send", json={"app_id": ready, "confirm": True})
+            self.assertEqual(resp.status_code, 200)
+            self.assertIs(resp.get_json()["sent"], True)
+            self.assertEqual(sender.call_count, 1)
+
+    def test_ui_cannot_rewrite_the_recipient_of_a_sent_application(self):
+        client = self.client()
         sent, ready = self.email_app(0), self.email_app(1)
         self.set_app(sent, recruiter_email="empleo0@repartorapido0.es", **ID16_STATE)
         before = self.app_row(sent)
