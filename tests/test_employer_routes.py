@@ -154,7 +154,7 @@ class TestEmployerRouteFound(EmployerRouteBase):
         self.assertEqual(res["status"], submitter.DRY_RUN_VALIDATED, res)
         self.assertEqual(res["mode"], submitter.DRY_RUN)
         self.assertFalse(site.clicked)
-        self.assertEqual(site.uploads, [str(FIXED_CV)])
+        self.assertEqual((site.uploads, site.filled), ([], {}))  # DRY_RUN touches nothing
         sender.assert_not_called()
         app = self.app_row(app_id)
         self.assertEqual((app["status"], app["submitted_at"], app["sent_at"]), (READY_TO_SUBMIT, "", ""))
@@ -338,7 +338,8 @@ class TestUnknownEmployer(EmployerRouteBase):
     def test_cover_letter_never_addresses_a_placeholder_employer(self):
         letter = application_prep.generate_cover_letter(UNKNOWN, self.profile, "driver")
         self.assertNotIn("Unknown", letter)
-        self.assertIn("Dear Hiring Team at your company", letter)
+        self.assertIn("Dear Hiring Team,", letter)  # truthful generic greeting, no invented name
+        self.assertNotIn("your company", letter)
 
 
 # --- Browser driver stops, DRY_RUN report, pipeline submission step --------------
@@ -365,8 +366,11 @@ class TestDriverAndPipelineStep(RouteBase):
         self.assertEqual(res["status"], submitter.DRY_RUN_VALIDATED, res)
         rep = self.report(app_id)
         self.assertEqual((rep["route_url"], rep["route_type"]), (url, "greenhouse"))
+        # DRY_RUN reports what WOULD be uploaded; nothing is uploaded.
         self.assertEqual((rep["cv_path"], rep["cv_sha256"], rep["cv_uploaded"]),
-                         (str(FIXED_CV), self.cv_hash, str(FIXED_CV)))
+                         (str(FIXED_CV), self.cv_hash, ""))
+        self.assertEqual(rep["would_submit"]["Resume/CV"], FIXED_CV.name)
+        self.assertEqual(site.uploads, [])
         self.assertTrue(rep["vacancy_match"]["verified"])
         self.assertIn("job title", rep["vacancy_match"]["matched"])
         self.assertIn("Email", rep["fields_prepared"])

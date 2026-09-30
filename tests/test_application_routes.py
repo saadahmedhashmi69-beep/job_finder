@@ -194,8 +194,9 @@ class TestPublicForms(RouteBase):
         res = self.submit(app_id, site)
         self.assertEqual(res["status"], submitter.DRY_RUN_VALIDATED, res)
         self.assertFalse(site.clicked)
-        self.assertEqual(site.uploads, [str(FIXED_CV)])
+        self.assertEqual((site.uploads, site.filled), ([], {}))  # DRY_RUN touches nothing
         rep = self.report(app_id)
+        self.assertEqual(rep["would_submit"]["Resume/CV"], FIXED_CV.name)
         self.assertEqual(rep["route_url"], url)
         self.assertEqual(rep["route_type"], "greenhouse")
         self.assertIn("Resume/CV", rep["fields_detected"])
@@ -218,6 +219,9 @@ class TestPublicForms(RouteBase):
 
     def test_generic_employer_form_follows_apply_link_and_ignores_other_forms(self):
         post, form = "https://careers.reparto.es/ofertas/42", "https://careers.reparto.es/ofertas/42/form"
+        # A candidate who is based in Spain (not relocating) answers "País" with Spain.
+        self.profile["candidate_facts"] = {"phone_country_code": "+34", "licences_valid_in_spain": ["B"]}
+        self.profile["location"] = "Barcelona, Spain"
         app_id = self.ready(dict(DRIVER, url=post))
         site = FakeSite({
             post: {"fields": [fld("q", label="Search")],
@@ -294,13 +298,14 @@ class TestPublicForms(RouteBase):
 
         res = self.fill_with_human(site, human)
         self.assertEqual(res["status"], submitter.DRY_RUN_VALIDATED, res)
-        self.assertEqual(site.uploads, [str(FIXED_CV)])
+        self.assertEqual((site.uploads, site.filled), ([], {}))  # DRY_RUN never uploads or types
         self.assertTrue(res["report"]["captcha_human_intervention"])
         self.assertFalse(site.clicked)  # DRY_RUN still never submits
 
         site.goto(self.CAPTCHA_URL)  # LIVE: resumes, submits, and still needs confirmation
         res = self.fill_with_human(site, human, mode=submitter.LIVE)
         self.assertTrue(site.clicked)
+        self.assertEqual(site.uploads, [str(FIXED_CV)])
         self.assertEqual(res["status"], SUBMITTED, res)
 
     def test_login_wall_never_waits_for_human(self):
@@ -348,12 +353,15 @@ class TestSubmissionSafety(RouteBase):
             storage.update_application(app_id, db_path=self.db, status=READY_TO_SUBMIT)
         # CV changing between preparation and the LIVE click blocks the submit.
         self.live_profile()
-        page = FakeSite({"u": {"fields": APPLY_FORM}})
+        form_url = "https://job-boards.greenhouse.io/reparto/jobs/cv"
+        page = FakeSite({form_url: {"fields": APPLY_FORM}})
+        answers = {"first_name": "A", "last_name": "B", "email": "a@b.es"}
         with mock.patch.object(submitter, "sha256_file", return_value="f" * 64):
-            res = submitter.fill_application_form(page, "u", {"email": "a@b.es"}, FIXED_CV,
+            res = submitter.fill_application_form(page, form_url, answers, FIXED_CV,
                                                   mode=submitter.LIVE, cv_sha256=self.cv_hash)
         self.assertEqual(res["status"], MANUAL_REQUIRED)
-        self.assertFalse(page.clicked)
+        self.assertIn("checksum", res["reason"])
+        self.assertEqual((page.clicked, page.uploads, page.filled), (False, [], {}))
 
     def test_placeholder_email_is_rejected(self):
         for bad in ("jobs@example.com", "test@test.com", "hr@company.test"):
@@ -504,7 +512,7 @@ class TestExistingManualReroute(RouteBase):
             res = self.submit(app_id, site)
         self.assertEqual(res["status"], submitter.DRY_RUN_VALIDATED, res)
         self.assertFalse(site.clicked)
-        self.assertEqual(site.uploads, [str(FIXED_CV)])
+        self.assertEqual((site.uploads, site.filled), ([], {}))  # DRY_RUN touches nothing
         app = self.app_row(app_id)
         self.assertEqual((app["status"], app["submitted_at"], app["sent_at"]), (READY_TO_SUBMIT, "", ""))
 
@@ -518,6 +526,10 @@ class TestExistingManualReroute(RouteBase):
                 mock.patch.object(pipeline, "JobMatcher", return_value=self.m), \
                 mock.patch.object(pipeline, "save_jobs", return_value=0), \
                 mock.patch.object(pipeline, "get_top_jobs", return_value=[checked]), \
+                mock.patch.object(pipeline, "get_pipeline_candidates", return_value=[checked]), \
+                mock.patch.object(pipeline, "recover_stale_runs", return_value=0), \
+                mock.patch.object(pipeline, "recover_stale_submissions", return_value=0), \
+                mock.patch.object(pipeline, "LOCK_PATH", self.tmp / ".pipeline.lock"), \
                 mock.patch.object(pipeline, "find_existing_application", return_value=None), \
                 mock.patch.object(pipeline, "start_pipeline_run", return_value=1), \
                 mock.patch.object(pipeline, "finish_pipeline_run"), \

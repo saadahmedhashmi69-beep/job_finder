@@ -8,6 +8,9 @@
 venv/
 *.db
 .email_enabled
+logs/
+.pipeline.lock
+.daemon.lock
 
 # User-specific content — fill these in locally, don't commit
 profile.yaml

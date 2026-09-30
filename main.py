@@ -51,11 +51,7 @@ LOCATION_AGNOSTIC_BOARDS = {"remotive", "arbeitnow", "himalayas", "greenhouse", 
 
 ALL_BOARDS = list(SCRAPERS.keys())
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
-)
+# Console + persistent logs/job_finder.log handlers are attached in main() (applog.setup_logging).
 logger = logging.getLogger("aiapply")
 
 
@@ -197,16 +193,10 @@ def cmd_scrape(args):
             except Exception as e:
                 logger.error(f"  {board_name} failed: {e}")
 
-    # Deduplicate by URL and by title+company fingerprint
-    seen_urls: set[str] = set()
-    seen_fingerprints: set[str] = set()
-    unique_jobs = []
-    for j in all_jobs:
-        fingerprint = f"{j.title.lower().strip()}|{j.company.lower().strip()}"
-        if j.url not in seen_urls and fingerprint not in seen_fingerprints:
-            seen_urls.add(j.url)
-            seen_fingerprints.add(fingerprint)
-            unique_jobs.append(j)
+    # Deduplicate by canonical URL and vacancy fingerprint (title + employer + city);
+    # malformed jobs are dropped instead of aborting the batch.
+    from fingerprint import dedupe_jobs
+    unique_jobs = dedupe_jobs(all_jobs)
 
     unique_jobs = _filter_old_jobs(unique_jobs, max_age_days=180)
 
@@ -278,8 +268,11 @@ def cmd_ui(args):
     """Launch the web UI."""
     from app import create_app
     app = create_app()
-    print(f"Starting AI Apply UI at http://localhost:{args.port}")
-    app.run(host="0.0.0.0", port=args.port, debug=args.debug)
+    if args.debug:
+        print("--debug is ignored: the Werkzeug debugger is never exposed.")
+    # Loopback only: the UI has LIVE actions and must not be reachable from the network.
+    print(f"Starting AI Apply UI at http://127.0.0.1:{args.port} (local access only)")
+    app.run(host="127.0.0.1", port=args.port, debug=False, use_reloader=False)
 
 
 def _print_jobs(jobs: List[Job]):
@@ -300,9 +293,10 @@ def _print_jobs(jobs: List[Job]):
 
 
 def cmd_pipeline(args):
-    """Run the full automation pipeline once."""
+    """Run the full automation pipeline once. Never submits or sends an application."""
     from pipeline import run_pipeline
     profile = load_profile()
+    # --max / --threshold given on the command line win over profile.yaml (None = use the profile).
     stats = run_pipeline(
         profile=profile,
         dry_run=args.dry_run,
@@ -310,33 +304,48 @@ def cmd_pipeline(args):
         threshold=args.threshold,
     )
     print(f"\nPipeline complete: {stats}")
+    print("No application was submitted or sent. To submit one: python main.py submit --app-id N")
 
 
 def cmd_prepare(args):
     """Qualify stored matched jobs and prepare applications (no scraping, no sending)."""
+    import safety
     from matcher import JobMatcher
     from application_prep import prepare_application
-    from storage import get_top_jobs
+    from storage import get_pipeline_candidates
     profile = load_profile()
     threshold = profile.get("pipeline", {}).get("auto_apply_threshold", 0.5)
     matcher = JobMatcher(profile)
-    jobs = [j for j in get_top_jobs(limit=args.limit, min_score=threshold) if j.get("description")]
+    jobs = get_pipeline_candidates(min_score=threshold, limit=args.limit)
     for job in jobs:
-        r = prepare_application(job, profile, matcher=matcher)
+        with safety.no_live_sends():  # preparation can never send
+            r = prepare_application(job, profile, matcher=matcher)
         print(f"{r['status']:<18} app={r['app_id'] or '-':<5} {job['match_score']:.2f}  "
               f"{job['title'][:45]} | {job['company'][:25]}  {'; '.join(r['reasons'])}")
 
 
 def cmd_submit(args):
-    """Submit READY_TO_SUBMIT applications (DRY_RUN unless LIVE is enabled in profile.yaml)."""
-    from storage import get_applications
-    from submitter import submit_application, get_submission_mode
+    """The explicit submit action. LIVE (both profile flags) really submits/sends
+    and therefore needs --app-id; without it, READY_TO_SUBMIT applications are
+    only inspected in DRY_RUN."""
+    from storage import get_applications, recover_stale_submissions
+    from submitter import DRY_RUN, LIVE, submit_application, get_submission_mode, _human_present
     profile = load_profile()
-    print(f"Submission mode: {get_submission_mode(profile)}")
-    ids = [args.app_id] if args.app_id else [
-        a["id"] for a in get_applications(status="READY_TO_SUBMIT", limit=args.limit)]
+    mode = DRY_RUN if args.dry_run else get_submission_mode(profile)
+    print(f"Submission mode: {mode}")
+    recover_stale_submissions()
+    if args.app_id:
+        ids = [args.app_id]
+    else:
+        if mode == LIVE:
+            print("LIVE submission needs an explicit application: python main.py submit --app-id N\n"
+                  "Without --app-id the READY_TO_SUBMIT applications are inspected in DRY_RUN only.")
+            mode = DRY_RUN
+        import storage
+        ids = [a["id"] for a in get_applications(status="READY_TO_SUBMIT", limit=args.limit,
+                                                 db_path=storage.DB_PATH)]
     for app_id in ids:
-        r = submit_application(int(app_id), profile)
+        r = submit_application(int(app_id), profile, mode=mode, interactive=_human_present())
         print(f"app {app_id}: {r['status']} - {r['reason']}")
 
 
@@ -552,6 +561,10 @@ def cmd_init_profile(args):
     from profile_generator import generate_profile_from_life_story
     life_story_path = Path(args.life_story).expanduser()
     output_path = Path(args.output).expanduser()
+    if output_path.exists() and not getattr(args, "force", False):
+        print(f"{output_path} already exists and would be overwritten. "
+              f"Pass --output <other file>, or --force to replace it.")
+        sys.exit(1)
 
     if not life_story_path.exists():
         print(f"Life story not found: {life_story_path}")
@@ -567,7 +580,71 @@ def cmd_init_profile(args):
         sys.exit(1)
 
 
+def cmd_readiness(args):
+    """Read-only live-readiness check. Prints facts only; never prints a secret,
+    never sends, never writes to the database."""
+    import hashlib
+    import inspect
+    import os
+    import sqlite3
+    import applier
+    import pipeline
+    import runlock
+    import submitter
+    from fixed_cv import resolve_fixed_cv_path
+    from storage import DB_PATH
+
+    checks = []
+
+    def check(name, ok, detail=""):
+        checks.append(bool(ok))
+        print(f"[{'OK' if ok else 'FAIL'}] {name}" + (f" - {detail}" if detail else ""))
+
+    profile = load_profile()
+    check("LIVE configuration present", submitter.get_submission_mode(profile) == submitter.LIVE,
+          f"submission mode = {submitter.get_submission_mode(profile)}")
+    check("Gmail credentials detected (values never shown)",
+          bool(os.environ.get("GMAIL_USER")) and bool(os.environ.get("GMAIL_APP_PASSWORD")))
+    try:
+        cv = resolve_fixed_cv_path(profile)
+        check("Fixed CV exists", True, f"{cv.name}, sha256 {hashlib.sha256(cv.read_bytes()).hexdigest()}")
+    except Exception as e:
+        check("Fixed CV exists", False, str(e))
+    try:
+        conn = sqlite3.connect(f"file:{DB_PATH.as_posix()}?mode=ro", uri=True)
+        n_apps = conn.execute("SELECT COUNT(*) FROM applications").fetchone()[0]
+        by_status = dict(conn.execute("SELECT status, COUNT(*) FROM applications GROUP BY status").fetchall())
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        conn.close()
+        check("Database readable (opened read-only)", integrity == "ok", f"{n_apps} applications {by_status}")
+    except Exception as e:
+        check("Database readable (opened read-only)", False, str(e))
+    src = inspect.getsource(pipeline)
+    check("Pipeline/daemon contain no direct send or submit call",
+          "submit_application(" not in src and "send_application_email" not in src and "smtplib" not in src
+          and "no_live_sends()" in src and "mode=submitter.DRY_RUN" in src)
+    check("SMTP timeout configured", "timeout=timeout" in inspect.getsource(applier.send_application_email_detailed),
+          f"{applier.smtp_timeout():.0f}s per operation")
+    check("Atomic submission claim present", "claim_application" in inspect.getsource(submitter.submit_application))
+    check("Pipeline/daemon single-instance lock present",
+          "FileLock(LOCK_PATH)" in src and "FileLock(DAEMON_LOCK_PATH" in src and hasattr(runlock, "FileLock"))
+    check("CAPTCHA wait is bounded and never reads stdin",
+          "input(" not in inspect.getsource(submitter) and submitter.CAPTCHA_WAIT_SECONDS > 0,
+          f"{submitter.CAPTCHA_WAIT_SECONDS:.0f}s")
+    check("UI binds to loopback only", 'host="127.0.0.1"' in inspect.getsource(cmd_ui))
+    from application_prep import candidate_facts, format_phone
+    facts = candidate_facts(profile)
+    check("Candidate phone has a country code", format_phone(profile).startswith("+"))
+    check("Profile does not claim to be based in the relocation destination",
+          not (facts["relocating_to"] and facts["location"] == facts["relocating_to"]))
+    print(f"\n{sum(checks)}/{len(checks)} checks passed. Nothing was sent or modified.")
+    if not all(checks):
+        sys.exit(1)
+
+
 def main():
+    from applog import setup_logging
+    setup_logging()
     parser = argparse.ArgumentParser(description="AI Apply — Automated job application pipeline")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -601,18 +678,23 @@ def main():
     # ui
     p_ui = subparsers.add_parser("ui", help="Launch web UI")
     p_ui.add_argument("--port", type=int, default=5000)
-    p_ui.add_argument("--debug", action="store_true")
+    p_ui.add_argument("--debug", action="store_true", help="Ignored (the debugger is never exposed)")
     p_ui.set_defaults(func=cmd_ui)
 
     # pipeline
     p_pipeline = subparsers.add_parser("pipeline", help="Run full automation cycle")
-    p_pipeline.add_argument("--dry-run", action="store_true", help="Preview without executing")
-    p_pipeline.add_argument("--max", type=int, default=10, help="Max applications per run")
-    p_pipeline.add_argument("--threshold", type=float, default=0.5, help="Min score to process")
+    p_pipeline.add_argument("--dry-run", "--preview", dest="dry_run", action="store_true",
+                            help="Preview only: no scraping, no application preparation. (Unrelated to the "
+                                 "submission DRY_RUN mode; the pipeline never submits in any case.)")
+    p_pipeline.add_argument("--max", type=int, default=None,
+                            help="Max applications per run (overrides profile.yaml; default: profile value or 10)")
+    p_pipeline.add_argument("--threshold", type=float, default=None,
+                            help="Min score to process (overrides profile.yaml; default: profile value or 0.5)")
     p_pipeline.set_defaults(func=cmd_pipeline)
 
     # daemon
-    p_daemon = subparsers.add_parser("daemon", help="Start background automation loop")
+    p_daemon = subparsers.add_parser(
+        "daemon", help="Start background automation loop (single instance; never submits applications)")
     p_daemon.add_argument("--interval", type=float, default=48.0, help="Hours between cycles")
     p_daemon.set_defaults(func=cmd_daemon)
 
@@ -625,10 +707,15 @@ def main():
     p_prep = subparsers.add_parser("prepare", help="Qualify matched jobs + prepare applications (no scrape/send)")
     p_prep.add_argument("--limit", type=int, default=50)
     p_prep.set_defaults(func=cmd_prepare)
-    p_sub = subparsers.add_parser("submit", help="Submit READY_TO_SUBMIT applications (DRY_RUN by default)")
-    p_sub.add_argument("--app-id", type=int, default=None)
-    p_sub.add_argument("--limit", type=int, default=5)
+    p_sub = subparsers.add_parser(
+        "submit", help="Explicitly submit ONE application (--app-id N). Real submission only when "
+                       "profile.yaml enables LIVE; without --app-id: DRY_RUN inspection only")
+    p_sub.add_argument("--app-id", type=int, default=None, help="Application to submit (required for LIVE)")
+    p_sub.add_argument("--limit", type=int, default=5, help="Max applications to inspect without --app-id")
+    p_sub.add_argument("--dry-run", action="store_true", help="Force DRY_RUN inspection even if LIVE is enabled")
     p_sub.set_defaults(func=cmd_submit)
+    p_ready = subparsers.add_parser("readiness", help="Read-only live-readiness check (sends nothing)")
+    p_ready.set_defaults(func=cmd_readiness)
 
     # answers
     p_answers = subparsers.add_parser("answers", help="Show form answers for a job")
@@ -658,6 +745,7 @@ def main():
         help="Output path for profile.yaml (default: profile.yaml in project root)"
     )
     p_init.add_argument("--model", default=None, help="Ollama model to use (auto-detected if not set)")
+    p_init.add_argument("--force", action="store_true", help="Overwrite an existing output file")
     p_init.set_defaults(func=cmd_init_profile)
 
     args = parser.parse_args()

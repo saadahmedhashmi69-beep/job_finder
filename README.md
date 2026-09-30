@@ -207,15 +207,31 @@ Prints a fill guide mapping form field names to your pre-generated answers.
 ### Run the Full Automation Pipeline (one shot)
 
 ```bash
-# Scrape → match → customize → cover letter → form answers → email
+# Scrape → match → qualify → prepare applications (fixed CV, letter, answers) → READY_TO_SUBMIT
 python main.py pipeline
 
-# Preview without generating any files
+# Preview only (no scraping, no preparation)
 python main.py pipeline --dry-run
 
-# Process up to 5 jobs above a 0.6 threshold
+# Process up to 5 jobs above a 0.6 threshold (command-line flags win over profile.yaml)
 python main.py pipeline --max 5 --threshold 0.6
 ```
+
+The pipeline **never submits or sends an application**, even when LIVE is enabled.
+It only inspects READY_TO_SUBMIT applications in DRY_RUN (nothing typed, uploaded or sent).
+
+### Submit an application (the only thing that sends)
+
+```bash
+python main.py submit                    # DRY_RUN inspection of READY_TO_SUBMIT applications
+python main.py submit --app-id 12        # explicit submit of ONE application
+python main.py readiness                 # read-only live-readiness check (sends nothing)
+```
+
+A real submission happens only when `profile.yaml` has both
+`pipeline.submission_mode: LIVE` and `pipeline.allow_live_submission: true`
+**and** you run `submit --app-id N` (or press Submit in the UI and confirm).
+Each application is claimed atomically, so it can be sent at most once.
 
 ### Run as Background Daemon
 
@@ -227,6 +243,8 @@ python main.py daemon
 python main.py daemon --interval 24
 ```
 
+Only one daemon / pipeline run can be active at a time. The daemon never submits.
+Logs go to the console and to `logs/job_finder.log`.
 Send `SIGTERM` or `Ctrl+C` for a graceful shutdown after the current cycle.
 
 ### Export to JSON
@@ -241,11 +259,11 @@ python main.py export --limit 100 --min-score 0.3 -o filtered.json
 ```bash
 python main.py ui
 
-# Custom port / debug mode
-python main.py ui --port 8080 --debug
+# Custom port
+python main.py ui --port 8080
 ```
 
-Open **http://localhost:5000** in your browser.
+Open **http://127.0.0.1:5000** in your browser. The UI listens on the local machine only.
 
 ---
 

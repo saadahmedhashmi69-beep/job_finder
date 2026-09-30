@@ -4,7 +4,7 @@
 <h2>Applications</h2>
 <p style="color:#6b7280">Only jobs that passed the hard qualification gate get an application
 (fixed CV + truthful cover letter + form answers). A match score alone never qualifies a job.
-Submission mode: <strong>{{ submission_mode }}</strong>{% if submission_mode == 'DRY_RUN' %} — forms are filled and validated but never submitted; no email is sent{% endif %}.
+Submission mode: <strong>{{ submission_mode }}</strong>{% if submission_mode == 'DRY_RUN' %} — forms are only inspected (nothing typed, uploaded or submitted); no email is sent{% else %} — nothing is ever submitted automatically: each application needs its own explicit Submit{% endif %}.
 {% if legacy_hidden %}<br><small>{{ legacy_hidden }} legacy record(s) created before the qualification gate are hidden.</small>{% endif %}</p>
 
 {% if applications %}
@@ -126,10 +126,15 @@ async function setRecruiterEmail(appId, email) {
     }
 }
 
+const SUBMISSION_MODE = {{ submission_mode | tojson }};
+
 async function submitApp(appId) {
+    // LIVE really submits/sends: it always needs an explicit confirmation.
+    const live = SUBMISSION_MODE === 'LIVE';
+    if (live && !confirm(`Submit application #${appId} for real (LIVE)? This cannot be undone.`)) return;
     const resp = await fetch('/api/application/submit', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({app_id: appId}),
+        body: JSON.stringify({app_id: appId, confirm: live}),
     });
     const data = await resp.json();
     alert(data.status === 'ok' ? `${data.result.status}: ${data.result.reason}` : 'Error: ' + data.error);

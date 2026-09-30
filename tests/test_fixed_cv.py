@@ -73,6 +73,8 @@ class FixedCVTestBase(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.profile = {
+            "name": "Raheel Tahir",
+            "email": "raheeltahir01@gmail.com",
             "pipeline": {
                 "fixed_cv_path": str(FIXED_CV),
                 "cv_dir": str(self.tmp / "cv"),
@@ -121,6 +123,11 @@ class TestPipelineUsesFixedCV(FixedCVTestBase):
             mock.patch.object(pipeline, "JobMatcher"),
             mock.patch.object(pipeline, "save_jobs", return_value=0),
             mock.patch.object(pipeline, "get_top_jobs", return_value=jobs),
+            mock.patch.object(pipeline, "get_pipeline_candidates", return_value=jobs),
+            # Never touch the real jobs.db / project lock from the pipeline's housekeeping.
+            mock.patch.object(pipeline, "recover_stale_runs", return_value=0),
+            mock.patch.object(pipeline, "recover_stale_submissions", return_value=0),
+            mock.patch.object(pipeline, "LOCK_PATH", self.tmp / ".pipeline.lock"),
             mock.patch.object(pipeline, "find_existing_application", return_value=None),
             mock.patch.object(storage, "find_existing_application", return_value=None),
             mock.patch.object(storage, "set_job_qualification"),
@@ -208,19 +215,23 @@ class TestAppFlows(FixedCVTestBase):
                                   app_id, db_path=self.db_path, **kw)),
             mock.patch("submitter.demote_unverified_submissions"),
             mock.patch.object(app_module, "load_profile", return_value=self.profile),
+            # The explicit submit path reads/writes through storage.DB_PATH.
+            mock.patch.object(storage, "DB_PATH", self.db_path),
         ]
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
         self.client = app_module.create_app().test_client()
 
-    def _insert_application(self, job, cv_pdf_path, cover_letter_pdf_path=""):
+    def _insert_application(self, job, cv_pdf_path, cover_letter_pdf_path="", cv_sha256=None):
         conn = self.get_db()
         slug = cv_customizer._slugify(f"{job['company']}-{job['title']}")
         cur = conn.execute(
             "INSERT INTO applications (job_url, slug, status, cv_pdf_path, cover_letter_pdf_path, "
-            "recruiter_email) VALUES (?, ?, 'READY_TO_SUBMIT', ?, ?, 'careers@acme-jobs.es')",
-            (job["url"], slug, cv_pdf_path, cover_letter_pdf_path),
+            "recruiter_email, application_method, cv_sha256) "
+            "VALUES (?, ?, 'READY_TO_SUBMIT', ?, ?, 'careers@acme-jobs.es', 'EMAIL', ?)",
+            (job["url"], slug, cv_pdf_path, cover_letter_pdf_path,
+             self._cv_hash if cv_sha256 is None else cv_sha256),
         )
         conn.commit()
         app_id = cur.lastrowid
@@ -264,51 +275,71 @@ class TestAppFlows(FixedCVTestBase):
     def test_generate_application_driver_uses_fixed_cv(self):
         self.assertEqual(self._generate(DRIVER_JOB), [str(FIXED_CV)])
 
-    def _approve_send(self, job, **insert_kwargs):
+    def _approve_send(self, job, expect_status=200, **insert_kwargs):
+        """LIVE approve-send = the one explicit submit path (submitter.submit_application)."""
+        import submitter
         app_id = self._insert_application(job, **insert_kwargs)
-        with mock.patch.object(applier, "send_application_email", return_value=True) as send:
-            resp = self.client.post(
-                "/api/application/approve-send",
-                json={"app_id": app_id, "recruiter_email": "careers@acme-jobs.es"},
-            )
-        self.assertEqual(resp.status_code, 200, resp.get_json())
-        send.assert_called_once()
-        return send.call_args.kwargs
+        with mock.patch.object(applier, "send_application_email_detailed",
+                               return_value={"ok": True, "error_class": "", "sent_possible": True,
+                                             "detail": ""}) as send, \
+                mock.patch.object(submitter, "qualify_job", side_effect=_qualified):
+            resp = self.client.post("/api/application/approve-send", json={"app_id": app_id, "confirm": True})
+        self.assertEqual(resp.status_code, expect_status, resp.get_json())
+        return app_id, send, resp
 
     def test_approve_send_receives_fixed_cv_for_fashion(self):
-        kwargs = self._approve_send(FASHION_JOB, cv_pdf_path=str(FIXED_CV))
+        app_id, send, _ = self._approve_send(FASHION_JOB, cv_pdf_path=str(FIXED_CV))
+        send.assert_called_once()
+        kwargs = send.call_args.kwargs
         self.assertEqual(Path(kwargs["cv_path"]), FIXED_CV)
+        self.assertEqual(kwargs["to_email"], "careers@acme-jobs.es")
         self.assertIn("Raheel Tahir", kwargs["subject"])
         self.assertIn("Raheel Tahir", kwargs["body"])
         self.assertNotIn("Ibrahim", kwargs["subject"] + kwargs["body"])
+        conn = self.get_db()
+        row = conn.execute("SELECT status, sent_at FROM applications WHERE id = ?", (app_id,)).fetchone()
+        conn.close()
+        self.assertEqual(row["status"], "SMTP_ACCEPTED")
+        self.assertTrue(row["sent_at"])
 
     def test_approve_send_receives_fixed_cv_for_driver(self):
-        kwargs = self._approve_send(DRIVER_JOB, cv_pdf_path=str(FIXED_CV))
-        self.assertEqual(Path(kwargs["cv_path"]), FIXED_CV)
+        _, send, _ = self._approve_send(DRIVER_JOB, cv_pdf_path=str(FIXED_CV))
+        self.assertEqual(Path(send.call_args.kwargs["cv_path"]), FIXED_CV)
 
-    def test_approve_send_ignores_other_pdfs_and_stale_cv_path(self):
+    def test_approve_send_needs_explicit_confirmation(self):
+        app_id = self._insert_application(FASHION_JOB, cv_pdf_path=str(FIXED_CV))
+        with mock.patch.object(applier, "send_application_email_detailed") as send:
+            resp = self.client.post("/api/application/approve-send", json={"app_id": app_id})
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("confirm", resp.get_json()["error"])
+        send.assert_not_called()
+
+    def test_approve_send_never_sends_a_stale_or_other_cv(self):
         # Legacy application: stored cv_pdf_path points at a generated CV and the
-        # application directory contains other PDFs. The fixed CV must still win.
+        # application directory contains other PDFs. Nothing is sent at all.
         app_dir = self.tmp / "cv" / "applications" / "fastmove-logistics-delivery-driver"
         app_dir.mkdir(parents=True)
         stale = app_dir / "cv-llt.pdf"
         stale.write_bytes(b"%PDF-1.4 generated")
         (app_dir / "aaa-other.pdf").write_bytes(b"%PDF-1.4 other")
-        cl = app_dir / "cover-letter.pdf"
-        cl.write_bytes(b"%PDF-1.4 cover letter")
-
-        kwargs = self._approve_send(DRIVER_JOB, cv_pdf_path=str(stale),
-                                    cover_letter_pdf_path=str(cl))
-        self.assertEqual(Path(kwargs["cv_path"]), FIXED_CV)
-        self.assertEqual(Path(kwargs["cover_letter_path"]), cl)
+        _, send, resp = self._approve_send(DRIVER_JOB, expect_status=400, cv_pdf_path=str(stale))
+        send.assert_not_called()
+        self.assertIn("Fixed CV path/checksum mismatch", resp.get_json()["error"])
+        # Same for a record whose checksum was never stored.
+        conn = self.get_db()
+        conn.execute("DELETE FROM applications")
+        conn.commit()
+        conn.close()
+        _, send, _ = self._approve_send(DRIVER_JOB, expect_status=400, cv_pdf_path=str(FIXED_CV), cv_sha256="")
+        send.assert_not_called()
 
     def test_approve_send_fails_clearly_when_fixed_cv_missing(self):
         self.profile["pipeline"]["fixed_cv_path"] = str(self.tmp / "missing.pdf")
         app_id = self._insert_application(FASHION_JOB, cv_pdf_path="")
-        with mock.patch.object(applier, "send_application_email") as send:
+        with mock.patch.object(applier, "send_application_email_detailed") as send:
             resp = self.client.post(
                 "/api/application/approve-send",
-                json={"app_id": app_id, "recruiter_email": "careers@acme-jobs.es"},
+                json={"app_id": app_id, "confirm": True},
             )
         self.assertEqual(resp.status_code, 400)
         self.assertIn("Fixed CV PDF not found", resp.get_json()["error"])

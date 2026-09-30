@@ -3,11 +3,12 @@
 import json
 import logging
 import threading
+from datetime import datetime
 from pathlib import Path
 
 import yaml
 from dotenv import load_dotenv
-from flask import Flask, render_template, request, jsonify, redirect, url_for
+from flask import Flask, render_template, request, jsonify, redirect, url_for, abort
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -25,6 +26,40 @@ from storage import (
 logger = logging.getLogger(__name__)
 CONFIG_PATH = Path(__file__).parent / "profile.yaml"
 
+_LOOPBACK_ADDRS = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
+_LOCAL_HOSTNAMES = {"127.0.0.1", "localhost", "[::1]", "::1"}
+_DOWNLOAD_SUFFIXES = {".pdf", ".md", ".txt"}
+
+
+def allowed_download(raw_path: str, profile: dict):
+    """The resolved file if it may be served, else None. Only the configured fixed
+    CV and files inside <cv_dir>/applications (PDF/Markdown/text) are allowed;
+    everything else on the machine (profile.yaml, .env, keys, system files) is refused."""
+    from cv_customizer import resolve_cv_dir
+    from fixed_cv import resolve_fixed_cv_path
+    raw_path = str(raw_path or "").strip()
+    # Network (UNC) and device paths are refused before the filesystem is touched:
+    # resolving them would make this machine contact another host.
+    if not raw_path or raw_path.startswith(("\\\\", "//")) or "\x00" in raw_path:
+        return None
+    try:
+        target = Path(raw_path).resolve(strict=True)
+    except (OSError, ValueError, RuntimeError):
+        return None
+    if not target.is_file() or target.suffix.lower() not in _DOWNLOAD_SUFFIXES:
+        return None
+    try:
+        if target == resolve_fixed_cv_path(profile):
+            return target
+    except Exception:
+        pass
+    try:
+        apps_root = (resolve_cv_dir(profile) / "applications").resolve()
+        target.relative_to(apps_root)
+        return target
+    except (OSError, ValueError):
+        return None
+
 
 def load_profile() -> dict:
     with open(CONFIG_PATH, encoding="utf-8") as f:
@@ -39,6 +74,21 @@ def create_app():
         demote_unverified_submissions()
     except Exception as e:
         logger.error("Could not reclassify unverified submissions: %s", e)
+
+    @app.before_request
+    def _local_requests_only():
+        """The UI can prepare and (explicitly) submit applications, so it serves the
+        local machine only: loopback client, local Host header (no DNS rebinding),
+        and for state-changing requests no foreign Origin/Referer (no cross-site POST)."""
+        from urllib.parse import urlparse as _urlparse
+        if (request.remote_addr or "") not in _LOOPBACK_ADDRS:
+            abort(403)
+        if (request.host or "").rsplit(":", 1)[0].lower() not in _LOCAL_HOSTNAMES:
+            abort(403)
+        if request.method not in ("GET", "HEAD", "OPTIONS"):
+            source = request.headers.get("Origin") or request.headers.get("Referer") or ""
+            if source and _urlparse(source).netloc.lower() != (request.host or "").lower():
+                abort(403)
 
     @app.route("/")
     def dashboard():
@@ -237,16 +287,9 @@ def create_app():
                     except Exception as e:
                         logger.error(f"Scrape error ({board.value}): {e}")
 
-            # Deduplicate by URL and title+company fingerprint
-            seen_urls = set()
-            seen_fingerprints = set()
-            unique = []
-            for j in all_jobs:
-                fp = f"{j.title.lower().strip()}|{j.company.lower().strip()}"
-                if j.url not in seen_urls and fp not in seen_fingerprints:
-                    seen_urls.add(j.url)
-                    seen_fingerprints.add(fp)
-                    unique.append(j)
+            # Deduplicate by canonical URL and vacancy fingerprint (title + employer + city)
+            from fingerprint import dedupe_jobs
+            unique = dedupe_jobs(all_jobs)
 
             # Filter out jobs from excluded countries
             if excluded_countries:
@@ -376,12 +419,12 @@ def create_app():
 
     @app.route("/download")
     def download_file():
-        """Serve a generated PDF file."""
+        """Serve the fixed CV or a generated application file - nothing else."""
         from flask import send_file
-        filepath = request.args.get("path", "")
-        if not filepath or not Path(filepath).exists():
-            return "File not found", 404
-        return send_file(filepath, as_attachment=True)
+        target = allowed_download(request.args.get("path", ""), load_profile())
+        if target is None:
+            return "File not available", 403
+        return send_file(str(target), as_attachment=True)
 
     @app.route("/api/generate-application", methods=["POST"])
     def api_generate_application():
@@ -398,11 +441,15 @@ def create_app():
             return jsonify({"status": "error", "error": "Job not found"})
 
         job = dict(row)
+        if not (job.get("description") or "").strip():
+            return jsonify({"status": "error", "error": "Job has no description - it cannot be qualified"})
         # Hard qualification gate: only QUALIFIED jobs get an application.
         # Synchronous — no LLM or CV generation involved (fixed CV only).
+        import safety
         from application_prep import prepare_application
         try:
-            result = prepare_application(job, load_profile())
+            with safety.no_live_sends():  # preparation can never send
+                result = prepare_application(job, load_profile())
         except Exception as e:
             logger.error("Application preparation failed: %s", e)
             return jsonify({"status": "error", "error": str(e)})
@@ -413,12 +460,17 @@ def create_app():
 
     @app.route("/api/application/submit", methods=["POST"])
     def api_submit_application():
-        """Run the web/email submission route. DRY_RUN unless LIVE is enabled in profile.yaml."""
-        from submitter import submit_application
+        """The explicit submit action. DRY_RUN inspection unless LIVE is enabled in
+        profile.yaml; a LIVE submission additionally needs {"confirm": true}."""
+        from submitter import LIVE, get_submission_mode, submit_application
         data = request.json or {}
         if not data.get("app_id"):
             return jsonify({"status": "error", "error": "app_id required"}), 400
-        result = submit_application(int(data["app_id"]), load_profile())
+        profile = load_profile()
+        if get_submission_mode(profile) == LIVE and data.get("confirm") is not True:
+            return jsonify({"status": "error", "error": "LIVE submission needs explicit confirmation "
+                            "(confirm: true)"}), 400
+        result = submit_application(int(data["app_id"]), profile, interactive=False)
         return jsonify({"status": "ok", "result": result})
 
     @app.route("/api/application/set-recruiter", methods=["POST"])
@@ -428,7 +480,21 @@ def create_app():
         recruiter_email = (data.get("recruiter_email") or "").strip()
         if not app_id:
             return jsonify({"status": "error", "error": "app_id required"}), 400
-        update_application(int(app_id), recruiter_email=recruiter_email)
+        # The recipient of a sent / attempted email is its send record (and what the
+        # recipient duplicate check matches on): it is never rewritten.
+        conn = get_db()
+        cur = conn.execute(
+            """UPDATE applications SET recruiter_email = ?, updated_at = ?
+               WHERE id = ? AND COALESCE(sent_at, '') = '' AND COALESCE(submitted_at, '') = ''
+                 AND COALESCE(submission_evidence, '') = ''
+                 AND status NOT IN ('SUBMITTING', 'SMTP_ACCEPTED', 'SUBMITTED', 'SUBMISSION_FAILED',
+                                    'UNVERIFIED_LEGACY')""",
+            (recruiter_email, datetime.now().isoformat(), int(app_id)))
+        conn.commit()
+        conn.close()
+        if cur.rowcount != 1:
+            return jsonify({"status": "error", "error": "Recipient cannot be changed: the application was "
+                            "already sent/attempted or does not exist"}), 409
         return jsonify({"status": "ok"})
 
     @app.route("/api/application/approve-send", methods=["POST"])
@@ -436,16 +502,14 @@ def create_app():
         """Approve an application and send the email.
 
         If `dry_run` is true, we send a *review email to the user* (with attachments)
-        and DO NOT email the recruiter.
+        and DO NOT email the recruiter. Otherwise this is the same explicit submit
+        action as /api/application/submit.
         """
-        from datetime import datetime as _dt
-        # Import lazily so review-email flow works even if email-sender module changes.
-        from applier import send_application_email, prepare_application_package
+        from applier import prepare_application_package
         from notifier import send_review_email
 
         data = request.json or {}
         app_id = data.get("app_id")
-        recruiter_email = (data.get("recruiter_email") or "").strip()
         dry_run = bool(data.get("dry_run", False))
 
         if not app_id:
@@ -464,102 +528,53 @@ def create_app():
 
         app_row = dict(row)
         if not dry_run:
-            from submitter import get_submission_mode, LIVE
-            if get_submission_mode(load_profile()) != LIVE:
+            # One sending path only: the explicit submit action (atomic claim,
+            # re-qualification, fixed-CV checksum, recipient/route validation).
+            from submitter import LIVE, SMTP_ACCEPTED, SUBMITTED, get_submission_mode, submit_application
+            profile = load_profile()
+            if get_submission_mode(profile) != LIVE:
                 return jsonify({"status": "error", "error": "LIVE sending is disabled (DRY_RUN is the default). "
                                 "Set pipeline.submission_mode: LIVE and allow_live_submission: true."}), 400
-            if app_row.get("status") != "READY_TO_SUBMIT" or app_row.get("submitted_at") or app_row.get("sent_at"):
-                return jsonify({"status": "error", "error": f"Not sendable (status {app_row.get('status')}); "
-                                "only qualified READY_TO_SUBMIT applications, never twice."}), 400
-        to_email = recruiter_email or (app_row.get("recruiter_email") or "").strip()
-        if not dry_run:
-            # Only a legitimate (non-placeholder) address printed in the posting.
-            from application_prep import find_application_email
-            to_email = find_application_email(app_row, to_email)
-            if not to_email:
-                return jsonify({"status": "error", "error": "MANUAL_REQUIRED: no legitimate application "
-                                "email in the job posting"}), 400
+            if data.get("confirm") is not True:
+                return jsonify({"status": "error", "error": "LIVE submission needs explicit confirmation "
+                                "(confirm: true)"}), 400
+            try:
+                result = submit_application(int(app_id), profile, interactive=False)
+            except Exception as e:
+                return jsonify({"status": "error", "error": str(e)}), 400
+            sent = result.get("status") in (SMTP_ACCEPTED, SUBMITTED)
+            return jsonify({"status": "ok" if sent else "error", "sent": sent, "result": result,
+                            "error": "" if sent else f"{result.get('status')}: {result.get('reason')}"}), \
+                (200 if sent else 400)
 
-        # CV is always the fixed PDF; the app dir only supplies the cover letter.
+        # dry_run: e-mail the package to the USER for review. The application's
+        # status and send evidence are never touched by this.
         from fixed_cv import resolve_fixed_cv_path, application_dir_for_slug, FixedCVMissingError
         profile = load_profile()
         try:
             fixed_cv = resolve_fixed_cv_path(profile)
         except FixedCVMissingError as e:
             return jsonify({"status": "error", "error": str(e)}), 400
-        if app_row.get("cover_letter_pdf_path"):
-            app_dir = Path(app_row["cover_letter_pdf_path"]).parent
-        else:
-            app_dir = application_dir_for_slug(app_row.get("slug") or "", profile)
+        app_dir = application_dir_for_slug(app_row.get("slug") or "", profile)
         package = prepare_application_package(app_dir, fixed_cv)
-
-        # Use cover-letter.md (if present) as email body
-        subject = app_row.get("email_subject") or f"Application for {app_row['title']} - Raheel Tahir"
-        md_cl = app_dir / "cover-letter.md"
-        body = ""
-        if md_cl.exists():
-            body = md_cl.read_text(encoding="utf-8")
-        if not body:
-            body = (
-                f"Hello,\n\nPlease find my application for the {app_row['title']} position at "
-                f"{app_row['company']}.\n\nBest regards,\nRaheel Tahir"
-            )
-
-        if dry_run:
-            # Store recruiter email and mark review sent (but NOT approved/sent)
-            update_application(
-                int(app_id),
-                recruiter_email=to_email or "",
-                status="review_sent",
-                email_subject=subject,
-                email_body=body,
-            )
-
-            # Send a review email to YOU with attachments.
-            recipient = profile.get("pipeline", {}).get("email_recipient") or ""
-            if recipient:
-                try:
-                    send_review_email(
-                        job={
-                            "title": app_row["title"],
-                            "company": app_row["company"],
-                            "url": app_row["job_url"],
-                            "match_score": app_row.get("match_score", 0) or 0,
-                        },
-                        cv_path=Path(package["cv"]),
-                        cl_path=Path(package["cover_letter"]) if package.get("cover_letter") else None,
-                        recipient=recipient,
-                    )
-                except Exception as e:
-                    # Always return JSON so the UI doesn't choke on HTML error pages.
-                    return jsonify({"status": "error", "error": f"Failed to send review email: {e}"}), 500
-            return jsonify({"status": "ok", "sent": False, "dry_run": True, "review_emailed": bool(recipient)})
-
-        # Mark approved (and store recruiter email)
-        update_application(
-            int(app_id),
-            recruiter_email=to_email,
-            approved_at=_dt.now().isoformat(),
-            email_subject=subject,
-            email_body=body,
-        )
-
-        ok = send_application_email(
-            to_email=to_email,
-            subject=subject,
-            body=body,
-            cv_path=package["cv"],
-            cover_letter_path=package.get("cover_letter"),
-        )
-
-        if ok:
-            # SMTP acceptance is not a verified submission.
-            update_application(int(app_id), status="SMTP_ACCEPTED", submission_status="SMTP_ACCEPTED",
-                               submission_mode="LIVE",
-                               status_reason=f"Email accepted by SMTP for {to_email}; not a verified submission",
-                               sent_at=_dt.now().isoformat())
-            return jsonify({"status": "ok", "sent": True})
-        return jsonify({"status": "error", "error": "Failed to send email"}), 500
+        recipient = profile.get("pipeline", {}).get("email_recipient") or ""
+        if recipient:
+            try:
+                send_review_email(
+                    job={
+                        "title": app_row["title"],
+                        "company": app_row["company"],
+                        "url": app_row["job_url"],
+                        "match_score": app_row.get("match_score", 0) or 0,
+                    },
+                    cv_path=Path(package["cv"]),
+                    cl_path=Path(package["cover_letter"]) if package.get("cover_letter") else None,
+                    recipient=recipient,
+                )
+            except Exception as e:
+                # Always return JSON so the UI doesn't choke on HTML error pages.
+                return jsonify({"status": "error", "error": f"Failed to send review email: {e}"}), 500
+        return jsonify({"status": "ok", "sent": False, "dry_run": True, "review_emailed": bool(recipient)})
 
     def _fetch_and_score(url: str, location: str = "") -> dict:
         """Fetch a job URL, extract description, score against profile. Returns score dict."""
@@ -699,7 +714,8 @@ def create_app():
 
     @app.route("/api/run-pipeline", methods=["POST"])
     def api_run_pipeline():
-        """Trigger a full pipeline run in background."""
+        """Trigger a full pipeline run in background. The pipeline never submits or
+        sends an application (see pipeline.run_pipeline); it only prepares them."""
         data = request.json or {}
         dry_run = data.get("dry_run", False)
 

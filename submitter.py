@@ -1,21 +1,27 @@
 """Submission of READY_TO_SUBMIT applications (web/ATS form or email).
 
+Submission is always an explicit action (`python main.py submit --app-id N`,
+the UI submit button). The pipeline and the daemon never submit: they run
+inside safety.no_live_sends(), where LIVE is forced down to DRY_RUN.
+
 Modes:
-  DRY_RUN (default) — open the form, fill fields, upload the fixed CV, validate
-                      required fields; NEVER clicks submit / sends email.
+  DRY_RUN (default) — inspect only. The form is opened and read, fields are
+                      mapped to profile answers and reported; NOTHING is typed,
+                      selected or uploaded, no submit is clicked, no email sent.
   LIVE              — only when profile.yaml has BOTH
                         pipeline.submission_mode: LIVE
                         pipeline.allow_live_submission: true
-                      Submits, then marks SUBMITTED only on observable
-                      confirmation (confirmation text, application id, or a
-                      known success redirect). Otherwise SUBMISSION_FAILED.
+                      The application is first claimed atomically
+                      (storage.claim_application): exactly one worker may
+                      submit it, and never if any earlier send/submission
+                      evidence exists. SUBMITTED is recorded only on strong,
+                      visible confirmation; SMTP acceptance is SMTP_ACCEPTED.
 
-The browser flow handles plain HTML forms (Greenhouse/Lever-style). CAPTCHA,
-login walls, missing CV upload fields, unknown required questions and anything
-else it cannot complete truthfully stop as MANUAL_REQUIRED. It never tries to
-bypass CAPTCHA, anti-bot protection or authentication. When run from a console,
-the browser is headed and a CAPTCHA pauses once for a person to solve it; the
-page is re-checked afterwards and is MANUAL_REQUIRED if the CAPTCHA remains.
+CAPTCHA, login walls, missing CV upload fields, unknown required questions and
+anything else that cannot be completed truthfully stop as MANUAL_REQUIRED.
+CAPTCHA/anti-bot protection is never bypassed or solved automatically. In an
+interactive explicit submit the browser is headed and a person may solve a
+challenge; the wait is bounded (CAPTCHA_WAIT_SECONDS) and never reads stdin.
 """
 
 from __future__ import annotations
@@ -24,16 +30,24 @@ import json
 import logging
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
+from urllib.parse import urlparse
 
+from bs4 import BeautifulSoup
+
+import safety
 import storage
-from application_prep import EMAIL, WEB, find_application_email, sha256_file
+from application_prep import (
+    EMAIL, WEB, application_subject, find_application_email, generate_cover_letter, generate_form_answers,
+    letter_problems, sha256_file,
+)
 from fixed_cv import resolve_fixed_cv_path
 from qualification import (
-    MANUAL_REQUIRED, QUALIFIED, READY_TO_SUBMIT, SMTP_ACCEPTED, SUBMISSION_FAILED, SUBMITTED,
-    UNVERIFIED_LEGACY,
+    MANUAL_REQUIRED, QUALIFIED, READY_TO_SUBMIT, SMTP_ACCEPTED, SUBMISSION_FAILED, SUBMITTED, SUBMITTING,
+    UNVERIFIED_LEGACY, qualify_job,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,6 +55,9 @@ logger = logging.getLogger(__name__)
 DRY_RUN = "DRY_RUN"
 LIVE = "LIVE"
 DRY_RUN_VALIDATED = "DRY_RUN_VALIDATED"
+# How long an interactive submit waits for a person to solve a challenge.
+CAPTCHA_WAIT_SECONDS = 180.0
+CAPTCHA_POLL_SECONDS = 2.0
 
 
 def get_submission_mode(profile: Optional[Dict]) -> str:
@@ -52,21 +69,54 @@ def get_submission_mode(profile: Optional[Dict]) -> str:
 
 # --- Page inspection ---------------------------------------------------------
 
-_CAPTCHA = re.compile(r"g-recaptcha|recaptcha/api|hcaptcha|cf-turnstile|captcha|challenges\.cloudflare\.com", re.I)
+# Full-page anti-bot challenge / interstitial: nothing else is reachable until it is passed.
+_CAPTCHA_CHALLENGE = re.compile(
+    r"challenges\.cloudflare\.com/cdn-cgi/challenge-platform|/cdn-cgi/challenge-platform|cf-chl-|"
+    r"<title[^>]*>\s*(just a moment|attention required|un momento|access denied|verif(y|ying) you are human|"
+    r"are you a robot|security check)|checking your browser before|verify(ing)? (that )?you are (a )?human|"
+    r"comprueba que eres humano|px-captcha|captcha-delivery\.com|datadome", re.I)
+# A CAPTCHA widget a person has to solve, embedded in the page/form.
+_CAPTCHA_WIDGET = re.compile(
+    r"class=[\"'][^\"']*\b(g-recaptcha|h-captcha|cf-turnstile|frc-captcha)\b"
+    r"|<iframe[^>]+src=[\"'][^\"']*(recaptcha|hcaptcha|turnstile|captcha)", re.I)
+# The widget's response token is filled in only after the challenge was solved.
+_CAPTCHA_TOKEN_HTML = re.compile(
+    r"name=[\"'](?:g-recaptcha-response|h-captcha-response|cf-turnstile-response|frc-captcha-solution)[\"']"
+    r"[^>]*?(?:value=[\"']([^\"']{8,})[\"']|>\s*([^<\s][^<]{7,})<)", re.I)
+_CAPTCHA_TOKEN_JS = (
+    "() => Array.from(document.querySelectorAll('[name=\"g-recaptcha-response\"],"
+    "[name=\"h-captcha-response\"],[name=\"cf-turnstile-response\"],[name=\"frc-captcha-solution\"]'))"
+    ".some(e => (e.value || '').length > 8)")
 _LOGIN_URL = re.compile(r"/(login|signin|sign-in|authwall|auth|account/login|uas/login)\b", re.I)
 _LOGIN_TEXT = re.compile(
     r"sign in to apply|log ?in to apply|create an account to apply|sign in to continue|"
     r"inicia sesi[oó]n para (aplicar|inscribirte|postular|continuar)|reg[ií]strate para (aplicar|inscribirte)", re.I)
+# Strong, human-readable statements that an application was received.
 _CONFIRM_TEXT = re.compile(
-    r"thank you for (applying|your application)|application (has been )?(received|submitted)|"
-    r"we have received your application|gracias por (tu|su) (candidatura|solicitud|inter[eé]s)|"
-    r"(candidatura|solicitud) (enviada|recibida)|hemos recibido tu (candidatura|solicitud)", re.I)
-_CONFIRM_URL = re.compile(r"/(thanks|thank-you|thank_you|confirmation|confirm|success|submitted)\b", re.I)
+    r"thank you for (applying|your application)|thanks for applying|"
+    r"(your )?application (has been |was )?(successfully )?(received|submitted|sent)|"
+    r"we(?: have|'ve) received your application|gracias por (tu|su) (candidatura|solicitud|inter[eé]s)|"
+    r"(candidatura|solicitud) (ha sido )?(enviada|recibida|registrada)( correctamente| con [eé]xito)?|"
+    r"hemos recibido (tu|su) (candidatura|solicitud)", re.I)
+_CONFIRM_PATH = re.compile(
+    r"/(thanks|thank-you|thank_you|thankyou|gracias|confirmation|confirmacion|success|submitted|"
+    r"application-(?:submitted|received|sent))/?$", re.I)
+_APPLICATION_ID = re.compile(
+    r"\b(application|candidatura|solicitud|confirmation|confirmaci[oó]n)\s+"
+    r"(id|number|no\.?|n[uú]mero|n[ºo°]\.?|ref(?:erence|erencia)?\.?|code|c[oó]digo)\s*[:#]?\s*"
+    r"([A-Za-z0-9][A-Za-z0-9-]{3,})", re.I)
+# Words that turn a nearby "confirmation" into a failure message.
+_NEGATION = re.compile(
+    r"\b(not|n't|no se|no ha|no pudo|error|errors|invalid|inv[aá]lid[oa]|missing|incorrect\w*|fail(?:ed|ure)?|"
+    r"unable|cannot|unsuccess\w*|incomplet\w*|falta\w*|formato|format|required|obligatori\w*|"
+    r"try again|int[eé]ntalo|expired|caducad\w*)\b", re.I)
+_PAGE_ERROR = re.compile(
+    r"\b(error|invalid|inv[aá]lid[oa]|required field|campo obligatorio|try again|int[eé]ntalo de nuevo|"
+    r"session (has )?expired|sesi[oó]n (ha )?(expirado|caducado)|sign in|log ?in|inicia sesi[oó]n)\b", re.I)
 # A legitimate application never asks the candidate for money or card details.
 _PAYMENT = re.compile(
     r"(application|registration|processing|admin(istration)?) fee|tasa de (inscripci[oó]n|tramitaci[oó]n)|"
     r"cuota de inscripci[oó]n|credit card number|n[uú]mero de (la )?tarjeta|name=.?(card.?number|cvv|iban)\b", re.I)
-_APPLICATION_ID = re.compile(r"(application|candidatura|solicitud) (id|number|n[uú]mero|ref(erence)?)\s*[:#]?\s*[A-Z0-9-]{4,}", re.I)
 
 # JS: describe every form control and tag it (and its form) with data-jf-* ids.
 _FIELDS_JS = r"""
@@ -147,13 +197,81 @@ def _answer_key(f: Dict) -> Optional[str]:
     return next((k for k, rx in _FIELD_MAP if re.search(rx, text)), None)
 
 
+def _visible_text(page=None, html: str = "") -> str:
+    """Text a person can read on the page: never script/style/template content,
+    hidden elements or attributes."""
+    if page is not None:
+        reader = getattr(page, "inner_text", None)
+        if callable(reader):
+            try:
+                text = reader("body")
+                if isinstance(text, str):
+                    return re.sub(r"\s+", " ", text).strip()
+            except Exception:
+                pass
+    soup = BeautifulSoup(html or "", "html.parser")
+    for tag in soup(["script", "style", "noscript", "template", "head", "title"]):
+        tag.decompose()
+    for tag in soup.find_all(True):
+        if tag.attrs is None:
+            continue
+        style = str(tag.get("style") or "").replace(" ", "").lower()
+        if (tag.has_attr("hidden") or tag.get("aria-hidden") == "true" or tag.get("type") == "hidden"
+                or "display:none" in style or "visibility:hidden" in style):
+            tag.decompose()
+    return re.sub(r"\s+", " ", soup.get_text(" ")).strip()
+
+
+def _captcha_state(html: str, page=None) -> str:
+    """'challenge' (blocking interstitial), 'unsolved' (embedded widget without a
+    response token), 'solved' (widget whose response token is filled in) or 'none'.
+
+    A widget that is still in the HTML is 'solved' only when its response token
+    exists; a bare script include or a "protected by reCAPTCHA" notice is not a
+    challenge a person could solve and is reported as 'none'."""
+    html = html or ""
+    if _CAPTCHA_CHALLENGE.search(html):
+        return "challenge"
+    if not _CAPTCHA_WIDGET.search(html):
+        return "none"
+    if _CAPTCHA_TOKEN_HTML.search(html):
+        return "solved"
+    if page is not None:
+        try:
+            if page.evaluate(_CAPTCHA_TOKEN_JS) is True:
+                return "solved"
+        except Exception:
+            pass
+    return "unsolved"
+
+
+def _password_wall(html: str) -> bool:
+    """A password field stands between the visitor and the application form.
+
+    Not a wall: the site's own header/login form sitting NEXT to a separate public
+    form that has the CV upload. A wall: a password field with no public upload
+    form on the page, or inside the very form that holds the upload (account
+    creation is part of applying)."""
+    if not re.search(r'type=["\']?password', html or "", re.I):
+        return False
+    soup = BeautifulSoup(html, "html.parser")
+
+    def has(node, kind):
+        return any((i.get("type") or "").lower() == kind for i in node.find_all("input"))
+
+    upload_forms = [f for f in soup.find_all("form") if has(f, "file")]
+    if not upload_forms:
+        return True
+    return any(has(f, "password") for f in upload_forms)
+
+
 def _blocked_reason(page) -> str:
-    """CAPTCHA / login wall on the current page ('' when the page is public)."""
+    """CAPTCHA / login wall / payment request on the current page ('' when public)."""
     html = page.content() or ""
-    if _CAPTCHA.search(html):
+    if _captcha_state(html, page) in ("challenge", "unsolved"):
         return "CAPTCHA detected - manual application required (never bypassed)"
-    if (_LOGIN_URL.search(page.url or "") or re.search(r'type=["\']?password', html, re.I)
-            or _LOGIN_TEXT.search(re.sub(r"<[^>]+>", " ", html))):
+    if (_LOGIN_URL.search(urlparse(page.url or "").path or "") or _password_wall(html)
+            or _LOGIN_TEXT.search(_visible_text(None, html))):
         return "Login required - manual application required (authentication never bypassed)"
     if _PAYMENT.search(html):
         return "Payment/fee requested - manual review required (never paid or filled automatically)"
@@ -167,14 +285,20 @@ def _visible_fields(page) -> List[Dict]:
 
 
 def _apply_link(page, visited: List[str]) -> str:
-    """A public 'Apply' link on the page (never a login-walled board or login page)."""
-    from application_prep import is_login_walled
+    """A public 'Apply' link on the page: a safe public URL on the same site or a
+    known ATS, never a login-walled board or login page."""
+    from application_prep import _host, ats_for_url, is_job_board, is_login_walled
+    here = _host(page.url or "")
     for link in page.evaluate(_LINKS_JS) or []:
         if not isinstance(link, dict):
             continue
         href = link.get("href") or ""
-        if (not href.startswith(("http://", "https://")) or href in visited or is_login_walled(href)
-                or _LOGIN_URL.search(href)):
+        if (not safety.is_safe_public_url(href) or href in visited or is_login_walled(href)
+                or is_job_board(href) or _LOGIN_URL.search(href)):
+            continue
+        host = _host(href)
+        same_site = bool(here) and (host == here or host.endswith("." + here) or here.endswith("." + host))
+        if not (same_site or ats_for_url(href)):
             continue
         if _APPLY_LINK_TEXT.search(link.get("text") or "") or re.search(r"/apply/?(\?|$)|/application/?(\?|$)", href):
             return href
@@ -190,23 +314,37 @@ def _goto(page, url: str):
 
 
 def _human_present() -> bool:
-    """A person is at the console and can be asked to solve a CAPTCHA."""
+    """A person is at the console of this process (an interactive terminal)."""
     try:
-        return bool(sys.stdin and sys.stdin.isatty())
+        return bool(sys.stdin and sys.stdin.isatty() and sys.stdout and sys.stdout.isatty())
     except Exception:
         return False
 
 
-def _wait_for_human(page, reason: str) -> bool:
-    """Block once until the person at the console presses Enter (no polling, no
-    retry loop). False when nobody confirmed; the caller re-checks the page."""
+def _wait_for_human(page, reason: str, timeout: Optional[float] = None, poll: Optional[float] = None,
+                    sleep: Callable = time.sleep, clock: Callable = time.monotonic) -> bool:
+    """Give a person at most `timeout` seconds to solve the challenge in the open
+    (headed) browser window. The page is polled; stdin is never read, so this can
+    never block forever. True as soon as the page is no longer blocked by a
+    CAPTCHA, False on timeout or if the page/browser went away."""
+    timeout = CAPTCHA_WAIT_SECONDS if timeout is None else timeout
+    poll = CAPTCHA_POLL_SECONDS if poll is None else poll
     try:
-        input(f"\n{reason}\n  Page: {page.url}\n"
-              "  Solve the CAPTCHA in the open browser window, then press Enter to continue "
-              "(Ctrl+C to leave it for manual application): ")
-    except (EOFError, KeyboardInterrupt):
-        return False
-    return True
+        print(f"\n{reason}\n  Page: {page.url}\n  Solve the CAPTCHA in the open browser window within "
+              f"{timeout:.0f}s; the form continues automatically once it is solved.", flush=True)
+    except Exception:
+        pass
+    deadline = clock() + timeout
+    while True:
+        try:
+            if not _blocked_reason(page).startswith("CAPTCHA"):
+                return True
+        except Exception:
+            return False
+        if clock() >= deadline:
+            logger.warning("CAPTCHA not solved within %gs - leaving the application for manual handling", timeout)
+            return False
+        sleep(poll)
 
 
 def fill_application_form(page, url: str, answers: Dict[str, str], cv_path: Path,
@@ -216,18 +354,24 @@ def fill_application_form(page, url: str, answers: Dict[str, str], cv_path: Path
 
     Opens `url` (following at most two public "Apply" links to reach the form),
     stops on CAPTCHA/login walls and (given `job`) on a page that shows some
-    other vacancy, uploads the fixed CV, fills only fields that
-    map to truthful profile answers and reports everything else. The final
-    submit button is clicked only in LIVE mode, after re-checking the CV hash.
+    other vacancy, and maps each field to a truthful profile answer.
 
-    On a CAPTCHA, `wait_for_human(page, reason)` (when given) pauses once so a
-    person can solve it in the browser; the page is then re-checked and the flow
-    continues only if nothing blocks it any more. The CAPTCHA is never bypassed.
+    Planning comes first and touches nothing. In DRY_RUN that is all that
+    happens: the report says what would be entered, but nothing is typed,
+    selected or uploaded. Only in LIVE, and only when every required field can
+    be answered, the CV upload field exists, a submit button exists and the CV
+    hash still matches, are the fields filled, the fixed CV uploaded and the
+    final submit clicked.
+
+    On a CAPTCHA, `wait_for_human(page, reason)` (when given) lets a person
+    solve it in the browser; the page is then re-checked and the flow continues
+    only if nothing blocks it any more. The CAPTCHA is never bypassed.
 
     Returns {"status", "reason", "filled", "missing_required", "evidence", "report"}.
     """
     report = {"route_url": url, "final_url": "", "navigated": [], "fields_detected": [],
-              "fields_prepared": {}, "fields_manual": [], "would_submit": {}, "cv_uploaded": ""}
+              "fields_prepared": {}, "fields_manual": [], "would_submit": {}, "cv_uploaded": "",
+              "submit_clicked": False}
     result = {"status": MANUAL_REQUIRED, "reason": "", "filled": [], "missing_required": [],
               "evidence": "", "report": report}
 
@@ -236,7 +380,7 @@ def fill_application_form(page, url: str, answers: Dict[str, str], cv_path: Path
     for hop in range(3):
         blocked = _blocked_reason(page)
         if blocked.startswith("CAPTCHA") and wait_for_human:
-            # Human solves it in the headed browser; same detection decides afterwards.
+            # A person solves it in the headed browser; the same detection decides afterwards.
             report["captcha_human_intervention"] = True
             if wait_for_human(page, blocked):
                 blocked = _blocked_reason(page)
@@ -262,6 +406,10 @@ def fill_application_form(page, url: str, answers: Dict[str, str], cv_path: Path
         report["navigated"].append(link)
         _goto(page, link)
     report["final_url"] = page.url
+    ok, why = safety.check_public_url(page.url or url)
+    if not ok:
+        result["reason"] = f"Form page is not a safe public URL ({why}) - nothing filled"
+        return result
 
     if not fields:
         result["reason"] = "No application form found on page"
@@ -274,14 +422,14 @@ def fill_application_form(page, url: str, answers: Dict[str, str], cv_path: Path
     if form_id not in (-1, None):
         fields = [f for f in fields if f.get("form", -1) == form_id]
 
-    manual, seen_groups = report["fields_manual"], set()
+    # --- Plan: decide every action without touching the page -------------------
+    manual, seen_groups, actions = report["fields_manual"], set(), []
     for f in fields:
         label = _field_label(f)
         report["fields_detected"].append(label)
         ftype, required = f["type"], bool(f.get("required"))
         if f is cv_field:
-            page.set_input_files(_selector(f), str(cv_path))
-            report["cv_uploaded"] = str(cv_path)
+            actions.append(("upload", _selector(f), str(cv_path)))
             report["fields_prepared"][label] = "cv_upload"
             report["would_submit"][label] = Path(cv_path).name
             result["filled"].append("cv_upload")
@@ -304,15 +452,14 @@ def fill_application_form(page, url: str, answers: Dict[str, str], cv_path: Path
                     wanted |= _SPAIN_NAMES
                 value = next((o for o in f.get("options") or [] if o.lower() in wanted), None)
                 if value:
-                    page.select_option(_selector(f), label=value)
+                    actions.append(("select", _selector(f), value))
         elif ftype not in _TEXT_TYPES and f["tag"] != "textarea":
             value = None  # number/date/etc.: nothing in the profile answers them truthfully
         elif key == "cover_letter" and f["tag"] != "textarea" and ftype != "text":
             value = None
         elif value:
-            page.fill(_selector(f), str(value))
+            actions.append(("fill", _selector(f), str(value)))
         if value:
-            f["value"] = str(value)
             report["fields_prepared"][label] = key
             report["would_submit"][label] = str(value)[:160]
             result["filled"].append(key)
@@ -329,10 +476,14 @@ def fill_application_form(page, url: str, answers: Dict[str, str], cv_path: Path
 
     if mode != LIVE:
         result["status"] = DRY_RUN_VALIDATED
-        result["reason"] = (f"DRY_RUN: {len(report['fields_prepared'])} fields filled incl. fixed CV; "
-                            f"final submit NOT clicked")
+        result["reason"] = (f"DRY_RUN: {len(report['fields_prepared'])} fields mapped incl. fixed CV; "
+                            f"nothing typed or uploaded, final submit NOT clicked")
         return result
 
+    # --- LIVE: every pre-condition holds; only now is the page touched ----------
+    if safety.live_sends_forbidden():
+        result["reason"] = "LIVE submission is disabled inside the pipeline/daemon - not submitted"
+        return result
     if cv_sha256 and sha256_file(cv_path) != cv_sha256:
         result["reason"] = "Fixed CV checksum changed before submit - not submitted"
         return result
@@ -341,29 +492,88 @@ def fill_application_form(page, url: str, answers: Dict[str, str], cv_path: Path
     if not submit:
         result["reason"] = "No submit button found - manual application required"
         return result
+    for kind, selector, value in actions:
+        if kind == "upload":
+            page.set_input_files(selector, value)
+            report["cv_uploaded"] = value
+        elif kind == "select":
+            page.select_option(selector, label=value)
+        else:
+            page.fill(selector, value)
+    blocked = _blocked_reason(page)  # e.g. a CAPTCHA that appeared while filling
+    if blocked:
+        result["reason"] = f"{blocked} (form filled but NOT submitted)"
+        return result
     before_html, before_url = page.content() or "", page.url
-    submit.click()
+    before_text = _visible_text(page, before_html)
+    # From here on the click may have reached the site, even if click() raises
+    # (e.g. a timeout after the click was dispatched): never "nothing submitted".
+    report["submit_clicked"] = True
     try:
-        page.wait_for_load_state("networkidle", timeout=20000)
-    except Exception:
-        pass
-    report["final_url"] = page.url
-    return {**result, **verify_submission(page, before_html=before_html, before_url=before_url)}
+        submit.click()
+        try:
+            page.wait_for_load_state("networkidle", timeout=20000)
+        except Exception:
+            pass
+        report["final_url"] = page.url
+        outcome = verify_submission(page, before_html=before_html, before_url=before_url, before_text=before_text)
+    except Exception as e:  # the click was attempted; its result could not be read
+        outcome = {"status": SUBMISSION_FAILED, "evidence": "",
+                   "reason": f"Submit clicked but the result page could not be read ({e.__class__.__name__}) "
+                             "- outcome unknown, verify manually; never retried automatically"}
+    return {**result, **outcome}
 
 
-def verify_submission(page, before_html: str = "", before_url: str = "") -> Dict:
-    """SUBMITTED only with observable confirmation that was not on the page
-    before submitting; otherwise SUBMISSION_FAILED (or MANUAL_REQUIRED)."""
+_FAILURE_NEARBY = re.compile(
+    r"\b(not|n't|no se|no ha|no pudo|error|errors|unable|cannot|could not|fail(?:ed|ure|s)?|unsuccess\w*|"
+    r"sin [eé]xito|incorrect\w*)\b", re.I)
+
+
+def _has_negation(text: str, start: int, end: int, strict: bool = False) -> bool:
+    """A failure word right next to the match. `strict` (application ids) also
+    treats validation wording ("invalid", "missing", "format", "required") as failure."""
+    if strict:
+        return bool(_NEGATION.search(text[max(0, start - 45):end + 45]))
+    return bool(_FAILURE_NEARBY.search(text[max(0, start - 30):start])
+                or _FAILURE_NEARBY.search(text[end:end + 25]))
+
+
+def verify_submission(page, before_html: str = "", before_url: str = "",
+                      before_text: Optional[str] = None) -> Dict:
+    """SUBMITTED only on strong, visible evidence that appeared after the click:
+
+      * a confirmation sentence a person can read (never script/hidden text),
+        not negated by a nearby failure word; or
+      * an application/confirmation id that contains a digit, in non-error
+        context; or
+      * a redirect whose PATH ends in a success segment, on a page that shows
+        no error/login text (query strings and partial words never count).
+
+    A CAPTCHA that appears after the click is MANUAL_REQUIRED. Everything else,
+    including a redirect to a login/account page, is SUBMISSION_FAILED."""
     html = page.content() or ""
-    text = re.sub(r"<[^>]+>", " ", html)
-    before_text = re.sub(r"<[^>]+>", " ", before_html or "")
-    if _CAPTCHA.search(html) and not _CAPTCHA.search(before_html or ""):
+    text = _visible_text(page, html)
+    if before_text is None:
+        before_text = _visible_text(None, before_html or "")
+    blocking = ("challenge", "unsolved")
+    if _captcha_state(html, page) in blocking and _captcha_state(before_html or "") not in blocking:
         return {"status": MANUAL_REQUIRED, "reason": "CAPTCHA shown after submit", "evidence": ""}
-    for rx, label in ((_CONFIRM_TEXT, "confirmation text"), (_APPLICATION_ID, "application id")):
-        m = rx.search(text)
-        if m and not rx.search(before_text):
-            return {"status": SUBMITTED, "reason": f"Confirmed by {label}", "evidence": m.group(0)[:200]}
-    if (page.url or "") != (before_url or "") and _CONFIRM_URL.search(page.url or ""):
+    path = urlparse(page.url or "").path or ""
+    before_path = urlparse(before_url or "").path or ""
+    if _LOGIN_URL.search(path) or _LOGIN_TEXT.search(text):
+        return {"status": SUBMISSION_FAILED, "evidence": "",
+                "reason": "Submit clicked but the site went to a login page - no confirmation observed"}
+
+    if not _CONFIRM_TEXT.search(before_text):
+        for m in _CONFIRM_TEXT.finditer(text):
+            if not _has_negation(text, m.start(), m.end()):
+                return {"status": SUBMITTED, "reason": "Confirmed by confirmation text", "evidence": m.group(0)[:200]}
+    for m in _APPLICATION_ID.finditer(text):
+        ident = m.group(3)
+        if (any(ch.isdigit() for ch in ident) and ident not in before_text
+                and not _has_negation(text, m.start(), m.end(), strict=True)):
+            return {"status": SUBMITTED, "reason": "Confirmed by application id", "evidence": m.group(0)[:200]}
+    if path != before_path and _CONFIRM_PATH.search(path) and not _PAGE_ERROR.search(text):
         return {"status": SUBMITTED, "reason": "Confirmed by success redirect", "evidence": page.url}
     return {"status": SUBMISSION_FAILED, "reason": "Submit clicked but no confirmation observed", "evidence": ""}
 
@@ -374,125 +584,257 @@ def _open_browser_page(headless: bool = True):
     pw = sync_playwright().start()
     browser = pw.chromium.launch(headless=headless)
     page = browser.new_page()
+    page.set_default_timeout(30000)
+    page.set_default_navigation_timeout(45000)
 
     def close():
-        browser.close()
-        pw.stop()
+        try:
+            browser.close()
+        finally:
+            pw.stop()
     return page, close
 
 
 # --- Orchestration -----------------------------------------------------------
 
+def _email_outcome(result) -> Dict:
+    """Normalise a sender's return value (detailed dict, or legacy bool)."""
+    if isinstance(result, dict):
+        return {"ok": bool(result.get("ok")), "error_class": str(result.get("error_class") or "unknown"),
+                "sent_possible": bool(result.get("sent_possible", True)), "detail": str(result.get("detail") or "")}
+    if result is True or (result and not isinstance(result, (str, bytes))):
+        return {"ok": True, "error_class": "", "sent_possible": True, "detail": ""}
+    # A bare False says nothing about how far the send got: treat the outcome as unknown.
+    return {"ok": False, "error_class": "unknown", "sent_possible": True, "detail": "Email sending failed"}
+
+
 def submit_application(app_id: int, profile: Dict, *, mode: Optional[str] = None,
                        page_factory: Optional[Callable] = None,
                        email_sender: Optional[Callable] = None,
-                       db_path: Optional[Path] = None) -> Dict:
-    """Run the web or email route for one READY_TO_SUBMIT application."""
+                       db_path: Optional[Path] = None,
+                       interactive: Optional[bool] = None, matcher=None) -> Dict:
+    """Run the web or email route for one READY_TO_SUBMIT application.
+
+    This is the explicit submit action. LIVE needs both profile flags and is
+    forced down to DRY_RUN inside safety.no_live_sends() (pipeline/daemon).
+    Before anything is sent the job is re-qualified under the current rules,
+    the letter/answers are regenerated from the current profile and checked for
+    grounding, and (LIVE) the application is claimed atomically."""
     db = db_path or storage.DB_PATH
     mode = mode if mode in (DRY_RUN, LIVE) else get_submission_mode(profile)
-    if mode == LIVE and get_submission_mode(profile) != LIVE:
-        mode = DRY_RUN  # LIVE must also be enabled in configuration
+    if mode == LIVE and (get_submission_mode(profile) != LIVE or safety.live_sends_forbidden()):
+        mode = DRY_RUN  # LIVE must be enabled in configuration and explicitly requested
     conn = storage.get_db(db)
     row = conn.execute(
-        """SELECT a.*, j.title, j.company, j.location, j.description, j.url
+        """SELECT a.*, j.title, j.company, j.location, j.description, j.url, j.board, j.date_posted, j.job_type
            FROM applications a JOIN jobs j ON a.job_url = j.url WHERE a.id = ?""", (app_id,)).fetchone()
     conn.close()
     if not row:
         return {"status": "error", "reason": "Application not found"}
     app = dict(row)
+
+    # Duplicate gates: any earlier send/submission evidence blocks, whatever the status says.
     if app["status"] == SUBMITTED or app.get("submitted_at"):
         return {"status": SUBMITTED, "reason": "Already submitted - duplicate submission blocked"}
+    if (app.get("sent_at") or app.get("submission_evidence") or app["status"] == SMTP_ACCEPTED
+            or app.get("submission_status") in (SUBMITTED, SMTP_ACCEPTED, UNVERIFIED_LEGACY)):
+        return {"status": app["status"],
+                "reason": "Already sent (send/submission evidence is recorded) - duplicate submission blocked"}
+    if app["status"] == SUBMITTING or app.get("submission_status") == SUBMITTING:
+        return {"status": SUBMITTING,
+                "reason": "Submission already in progress or interrupted - duplicate submission blocked"}
     if app["status"] != READY_TO_SUBMIT:
         return {"status": app["status"], "reason": f"Not READY_TO_SUBMIT (status {app['status']})"}
+    logger.info("Submission attempt: application #%s (%s, mode %s) %s at %s", app_id,
+                app.get("application_method") or "?", mode, app.get("title"), app.get("company"))
 
     # Fixed CV only: exact configured file, SHA-256 must match the one recorded at preparation.
     cv_path = resolve_fixed_cv_path(profile)
     if (Path(app["cv_pdf_path"] or "").resolve() != cv_path or not app.get("cv_sha256")
             or sha256_file(cv_path) != app["cv_sha256"]):
         return _record(app_id, db, mode, MANUAL_REQUIRED, "Fixed CV path/checksum mismatch")
-    answers = json.loads(app.get("form_answers_json") or "{}")
+
+    # The job must pass TODAY's qualification rules, not only those of the day it was prepared.
+    q = qualify_job(app, profile, matcher=matcher)
+    if q.status != QUALIFIED:
+        storage.set_job_qualification(app["job_url"], q.status, q.category, q.reasons, db_path=db)
+        return _record(app_id, db, mode, MANUAL_REQUIRED,
+                       f"Job no longer passes qualification ({q.status}): {'; '.join(q.reasons)}")
+
+    # Content is regenerated from the current profile (a stored letter may be stale) and checked.
+    letter = generate_cover_letter(app, profile, q.category)
+    problems = letter_problems(letter, profile)
+    if problems:
+        return _record(app_id, db, mode, MANUAL_REQUIRED,
+                       "Application content is not grounded in the profile: " + "; ".join(problems))
+    answers = generate_form_answers(app, profile, q.category, letter)
+    subject = application_subject(app, profile)
+    if letter != (app.get("email_body") or "") or subject != (app.get("email_subject") or ""):
+        storage.update_application(app_id, db_path=db, email_body=letter, email_subject=subject,
+                                   form_answers_json=json.dumps(answers))
 
     if app.get("application_method") == WEB:
         from application_prep import is_login_walled
         route_url = app.get("application_url") or app["url"]
         report = {"route_url": route_url, "route_type": app.get("route_type") or "",
                   "cv_path": str(cv_path), "cv_sha256": app["cv_sha256"]}
+        ok, why = safety.check_public_url(route_url)
+        if not ok:
+            return _record(app_id, db, mode, MANUAL_REQUIRED,
+                           f"Application URL is not a safe public URL ({why}) - never opened", report=report)
         if is_login_walled(route_url):
             return _record(app_id, db, mode, MANUAL_REQUIRED,
                            "Application route is a login-walled job board - not automated", report=report)
-        # Real browser + a person at the console: headed, so a CAPTCHA can be solved by hand.
-        human = page_factory is None and _human_present()
-        try:
-            page, close = (page_factory() if page_factory else _open_browser_page(headless=not human))
-        except ImportError:
+        # The stored route may predate today's ownership rules: it must still belong to this employer/vacancy.
+        import application_prep
+        source = app.get("route_source") or ("job_url" if route_url == app["url"] else "")
+        problem = application_prep.verify_route(app, {"url": route_url, "source": source},
+                                                fetch=application_prep._http_fetch)
+        if problem:
             return _record(app_id, db, mode, MANUAL_REQUIRED,
-                           "Playwright not installed (pip install playwright; playwright install chromium)",
-                           report=report)
+                           f"Application URL not used: {problem}", report=report)
+        if page_factory is None:  # real browser: the host must not resolve to a private address
+            ok, why = safety.resolves_to_public(route_url)
+            if not ok:
+                return _record(app_id, db, mode, MANUAL_REQUIRED,
+                               f"Application URL refused ({why}) - never opened", report=report)
+        # A person can help only in an explicit interactive LIVE submit with a real browser.
+        if interactive is None:
+            interactive = _human_present()
+        human = bool(interactive) and page_factory is None and mode == LIVE
+        if mode == LIVE and not storage.claim_application(app_id, db):
+            return {"status": SUBMITTING, "reason": "Application is already claimed by another submitter or "
+                                                    "carries send evidence - duplicate submission blocked"}
+        claimed = mode == LIVE
+        close = None
         try:
-            res = fill_application_form(page, route_url, answers, cv_path, mode=mode,
-                                        cv_sha256=app["cv_sha256"], job=app,
-                                        wait_for_human=_wait_for_human if human else None)
+            try:
+                page, close = (page_factory() if page_factory else _open_browser_page(headless=not human))
+            except ImportError:
+                return _record(app_id, db, mode, MANUAL_REQUIRED,
+                               "Playwright not installed (pip install playwright; playwright install chromium)",
+                               report=report, claimed=claimed)
+            try:
+                res = fill_application_form(page, route_url, answers, cv_path, mode=mode,
+                                            cv_sha256=app["cv_sha256"], job=app,
+                                            wait_for_human=_wait_for_human if human else None)
+            except Exception as e:
+                # fill_application_form handles everything after the click itself, so
+                # an exception here means nothing was submitted.
+                logger.exception("Browser automation stopped for application #%s", app_id)
+                res = {"status": MANUAL_REQUIRED, "reason": f"Browser automation stopped: {e}", "evidence": ""}
         except Exception as e:
-            res = {"status": MANUAL_REQUIRED, "reason": f"Browser automation stopped: {e}", "evidence": ""}
+            res = {"status": MANUAL_REQUIRED, "reason": f"Browser could not be started: {e}", "evidence": ""}
         finally:
-            close()
+            if close:
+                try:
+                    close()
+                except Exception as e:
+                    logger.warning("Browser did not close cleanly: %s", e)
         report.update(res.get("report") or {})
-        return _record(app_id, db, mode, res["status"], res["reason"], res.get("evidence", ""), report=report)
+        return _record(app_id, db, mode, res["status"], res["reason"], res.get("evidence", ""), report=report,
+                       claimed=claimed)
 
     if app.get("application_method") == EMAIL:
         to = find_application_email(app, app.get("recruiter_email") or "")
         if not to:
             return _record(app_id, db, mode, MANUAL_REQUIRED, "No legitimate application email")
+        earlier = storage.recipient_already_emailed(to, app_id, db)
+        if earlier:
+            return _record(app_id, db, mode, MANUAL_REQUIRED,
+                           f"{to} already received application #{earlier} - a second email needs a human decision")
         if mode != LIVE:
             return _record(app_id, db, mode, DRY_RUN_VALIDATED,
                            f"DRY_RUN: email to {to} prepared with fixed CV; NOT sent")
-        from applier import send_application_email
-        sender = email_sender or send_application_email
-        ok = sender(to_email=to, subject=app.get("email_subject") or f"Application for {app['title']}",
-                    body=app.get("email_body") or "", cv_path=cv_path, cover_letter_path=None)
-        if ok:
+        if not storage.claim_application(app_id, db):
+            return {"status": SUBMITTING, "reason": "Application is already claimed by another submitter or "
+                                                    "carries send evidence - duplicate submission blocked"}
+        # Re-check under the claim: two different applications for the same address,
+        # submitted at the same moment, must not both go out.
+        storage.update_application_if_status(app_id, (SUBMITTING,), db_path=db, recruiter_email=to)
+        rival = storage.recipient_already_emailed(to, app_id, db, include_in_progress=True)
+        if rival:
+            return _record(app_id, db, mode, MANUAL_REQUIRED,
+                           f"{to} is already being emailed / was emailed by application #{rival} - "
+                           "a second email needs a human decision", claimed=True)
+        if email_sender is None:
+            from applier import send_application_email_detailed as email_sender
+        try:
+            outcome = _email_outcome(email_sender(to_email=to, subject=subject, body=letter, cv_path=cv_path,
+                                                  cover_letter_path=None))
+        except Exception as e:
+            logger.exception("Email sender raised for application #%s", app_id)
+            return _record(app_id, db, mode, SUBMISSION_FAILED,
+                           f"Exception during send ({e.__class__.__name__}) - delivery state unknown; "
+                           "check the Sent folder. Never retried automatically", claimed=True)
+        if outcome["ok"]:
             # SMTP acceptance is not proof that an application was received.
             return _record(app_id, db, mode, SMTP_ACCEPTED,
-                           f"Email accepted by SMTP server for {to}; not a verified submission")
-        return _record(app_id, db, mode, SUBMISSION_FAILED, "Email sending failed")
+                           f"Email accepted by SMTP server for {to}; not a verified submission", claimed=True)
+        detail = f"{outcome['error_class']}: {outcome['detail']}".strip(": ")
+        if outcome["error_class"] == "recipient_rejected" and not outcome["sent_possible"]:
+            return _record(app_id, db, mode, MANUAL_REQUIRED, f"Recipient rejected ({detail}) - nothing was sent",
+                           claimed=True)
+        if not outcome["sent_possible"]:
+            # Provably nothing left this machine: the claim is released for an explicit retry.
+            return _record(app_id, db, mode, SUBMISSION_FAILED,
+                           f"Email NOT sent ({detail}). Nothing left this machine; an explicit submit may retry",
+                           keep_ready=True, claimed=True)
+        return _record(app_id, db, mode, SUBMISSION_FAILED,
+                       f"Email sending failed ({detail}) - delivery state unknown; never retried automatically",
+                       claimed=True)
 
     return _record(app_id, db, mode, MANUAL_REQUIRED, "No supported application method")
 
 
 def process_ready_applications(profile: Dict, *, db_path: Optional[Path] = None, limit: int = 10,
                                page_factory: Optional[Callable] = None,
-                               email_sender: Optional[Callable] = None) -> Dict[str, int]:
-    """Pipeline step: run READY_TO_SUBMIT applications through submit_application.
+                               email_sender: Optional[Callable] = None,
+                               mode: Optional[str] = None, interactive: Optional[bool] = False) -> Dict[str, int]:
+    """Run READY_TO_SUBMIT applications through submit_application.
 
-    DRY_RUN (default): validates each application once (already
-    DRY_RUN_VALIDATED ones are skipped); nothing is submitted or sent.
-    LIVE (both profile flags): submits each READY_TO_SUBMIT application once —
-    every LIVE outcome moves it out of READY_TO_SUBMIT, so nothing is retried
-    or resubmitted. Returns outcome counts."""
+    The pipeline calls this with mode=DRY_RUN (inside safety.no_live_sends()):
+    each application is inspected once (already DRY_RUN_VALIDATED ones are
+    skipped) and nothing is submitted or sent. Only an explicit caller may pass
+    LIVE-enabled configuration; then each application is claimed and submitted
+    at most once. Returns outcome counts."""
     db = db_path or storage.DB_PATH
-    mode = get_submission_mode(profile)
+    effective = mode if mode in (DRY_RUN, LIVE) else get_submission_mode(profile)
+    if effective == LIVE and (get_submission_mode(profile) != LIVE or safety.live_sends_forbidden()):
+        effective = DRY_RUN
     conn = storage.get_db(db)
     rows = conn.execute(
         """SELECT a.id, a.submission_status FROM applications a JOIN jobs j ON a.job_url = j.url
            WHERE a.status = ? AND j.qualification_status = ? AND COALESCE(a.submitted_at, '') = ''
+             AND COALESCE(a.sent_at, '') = ''
            ORDER BY a.id""", (READY_TO_SUBMIT, QUALIFIED)).fetchall()
     conn.close()
-    ids = [r[0] for r in rows if mode == LIVE or (r[1] or "") != DRY_RUN_VALIDATED][:max(0, limit)]
+    ids = [r[0] for r in rows if effective == LIVE or (r[1] or "") != DRY_RUN_VALIDATED][:max(0, limit)]
     counts: Dict[str, int] = {}
+    matcher = None
+    if ids:
+        from matcher import JobMatcher
+        matcher = JobMatcher(profile)
     for app_id in ids:
         try:
-            outcome = submit_application(app_id, profile, page_factory=page_factory,
-                                         email_sender=email_sender, db_path=db)["status"]
+            outcome = submit_application(app_id, profile, mode=effective, page_factory=page_factory,
+                                         email_sender=email_sender, db_path=db, interactive=interactive,
+                                         matcher=matcher)["status"]
         except Exception as e:  # one broken application never stops the run
-            logger.error("Application #%s could not be processed: %s", app_id, e)
+            logger.exception("Application #%s could not be processed: %s", app_id, e)
             outcome = "error"
         counts[outcome] = counts.get(outcome, 0) + 1
     return counts
 
 
 def _record(app_id: int, db: Path, mode: str, outcome: str, reason: str, evidence: str = "",
-            report: Optional[Dict] = None) -> Dict:
-    """Persist the outcome. DRY_RUN keeps the application READY_TO_SUBMIT."""
+            report: Optional[Dict] = None, keep_ready: bool = False, claimed: bool = False) -> Dict:
+    """Persist the outcome. DRY_RUN keeps the application READY_TO_SUBMIT, as does
+    a LIVE failure that provably happened before anything was sent (`keep_ready`).
+
+    The write is conditional on the state this worker expects: SUBMITTING when it
+    holds the claim (`claimed`), READY_TO_SUBMIT otherwise. If another worker has
+    moved the application on in the meantime, nothing is overwritten."""
     if outcome == SUBMITTED and not evidence:
         outcome, reason = SUBMISSION_FAILED, f"{reason} (no observable evidence)"
     fields = {"submission_mode": mode, "submission_status": outcome, "status_reason": reason,
@@ -500,19 +842,27 @@ def _record(app_id: int, db: Path, mode: str, outcome: str, reason: str, evidenc
     if report is not None:
         fields["submission_report_json"] = json.dumps(report)
     if outcome != DRY_RUN_VALIDATED:
-        fields["status"] = outcome
+        fields["status"] = READY_TO_SUBMIT if keep_ready else outcome
     if outcome == SUBMITTED:
         fields["submitted_at"] = datetime.now().isoformat()
     if outcome == SMTP_ACCEPTED:
         fields["sent_at"] = datetime.now().isoformat()
-    storage.update_application(app_id, db_path=db, **fields)
+    expected = (SUBMITTING,) if claimed else (READY_TO_SUBMIT,)
+    if not storage.update_application_if_status(app_id, expected, db_path=db, **fields):
+        logger.warning("Application #%s changed state concurrently; %s outcome '%s' was NOT recorded over it",
+                       app_id, mode, outcome)
+        return {"status": outcome, "reason": f"{reason} (not recorded: the application was changed by another "
+                                             "worker in the meantime)", "evidence": evidence, "mode": mode,
+                "report": report or {}, "retryable": False, "recorded": False}
     if outcome == SUBMITTED:
         conn = storage.get_db(db)
         conn.execute("UPDATE jobs SET applied = 1 WHERE url = (SELECT job_url FROM applications WHERE id = ?)",
                      (app_id,))
         conn.commit()
         conn.close()
-    return {"status": outcome, "reason": reason, "evidence": evidence, "mode": mode, "report": report or {}}
+    logger.info("Submission result: application #%s -> %s (%s) %s", app_id, outcome, mode, reason)
+    return {"status": outcome, "reason": reason, "evidence": evidence, "mode": mode, "report": report or {},
+            "retryable": keep_ready, "recorded": True}
 
 
 # --- Verified-submission contract ---------------------------------------------
@@ -532,6 +882,7 @@ def demote_unverified_submissions(db_path: Optional[Path] = None) -> int:
 
     Legacy/test rows become UNVERIFIED_LEGACY; current-workflow EMAIL rows become
     SMTP_ACCEPTED. Their job is no longer flagged applied. No evidence is invented.
+    sent_at is kept: it is the record that something was sent and blocks re-sending.
     Returns the number of rows reclassified.
     """
     db = db_path or storage.DB_PATH

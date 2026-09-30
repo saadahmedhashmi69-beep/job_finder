@@ -107,9 +107,28 @@ def _company_tokens(company: str) -> List[str]:
     return [t for t in tokens if len(t) > 1 and t not in _LEGAL_SUFFIX] or tokens
 
 
+# Public suffixes made of two labels (no PSL dependency; enough for the boards in use).
+_TWO_LABEL_SUFFIXES = {"co.uk", "org.uk", "ac.uk", "gov.uk", "com.es", "org.es", "nom.es", "gob.es", "edu.es",
+                       "com.ar", "com.mx", "com.br", "com.co", "com.pe", "com.tr", "com.au", "co.jp", "co.in",
+                       "co.nz", "com.pt", "com.pk", "co.za"}
+
+
+def _employer_labels(url: str) -> List[str]:
+    """Host labels that can identify the employer: the registrable name
+    (empleo.MERCADONA.es), or on a multi-tenant ATS the tenant sub-domain
+    (MERCADONA.teamtailor.com). Anything left of someone else's registrable
+    domain (mercadona.es.evil.net) identifies nobody."""
+    labels = [lab for lab in prep._host(url).split(".") if lab]
+    n = 3 if ".".join(labels[-2:]) in _TWO_LABEL_SUFFIXES else 2
+    if len(labels) < n:
+        return []
+    chosen = labels[:-n] if prep.ats_for_url(url) else [labels[-n]]
+    return [part for lab in chosen for part in lab.split("-") if part]
+
+
 def _host_is_employer(url: str, company: str) -> bool:
     """The host itself carries the employer's name (e.g. empleo.mercadona.es)."""
-    labels = re.split(r"[.\-]", prep._host(url))
+    labels = _employer_labels(url)
     tokens = _company_tokens(company)
     slug = "".join(tokens)
     if len(slug) >= 5 and slug in "".join(labels):

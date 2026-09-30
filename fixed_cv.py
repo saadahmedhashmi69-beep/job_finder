@@ -66,11 +66,13 @@ def prepare_fixed_cv_application(
     Drop-in replacement for customize_cv_for_job()'s result, but the CV path is
     always the fixed PDF. Raises FixedCVMissingError if the PDF is missing.
     """
-    from cv_customizer import _slugify
+    from fingerprint import unique_slug
 
     cv_path = resolve_fixed_cv_path(profile)
 
-    slug = _slugify(f"{company}-{title}") or _slugify(company or "unknown")
+    # The slug ends in a digest of the posting URL: two vacancies can never share
+    # (and overwrite) one application directory, however similar their names.
+    slug = unique_slug(company, title, job_url)
     app_dir = application_dir_for_slug(slug, profile)
     app_dir.mkdir(parents=True, exist_ok=True)
 

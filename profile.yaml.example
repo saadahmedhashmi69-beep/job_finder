@@ -149,6 +149,19 @@ weights:
   experience: 0.05  # Life-story text similarity
   remote: 0.10      # Boost fully-remote / home-office roles (when remote_preferred: true)
 
+# --- Candidate facts (must mirror the CV; anything not stated is NOT assumed) ---
+# Used by cover letters / form answers and by the eligibility checks.
+# candidate_facts:
+#   current_location: "Country or City, Country"   # where you live today
+#   relocating_to: "Barcelona, Spain"              # letters say "relocating to", never "based in"
+#   work_authorisation: "a 2-year Spanish work visa"
+#   phone_country_code: "+34"                      # phone is written internationally, or omitted
+#   languages: [English, Spanish]                  # postings requiring another language are held for review
+#   driving_licences: ["Spain (class B)"]          # quoted in driver letters
+#   licences_valid_in_spain: [B]                   # driving roles need this; without it they are held for review
+#   driving_experience_years: 2                    # postings requiring driving experience need this
+#   accepts_internships: false
+
 # --- Pipeline Automation ---
 pipeline:
   auto_apply_threshold: 0.50   # Min score to trigger CV/cover letter generation
@@ -160,6 +173,11 @@ pipeline:
   # Relative to project root, or absolute.
   fixed_cv_path: "cv/Raheel Tahir Resume Updated.pdf"
   ollama_model: "qwen3.5:9b"   # Set by setup_ollama.sh based on your hardware
+  # Submission gate. DRY_RUN (default) only inspects forms and never sends.
+  # LIVE needs BOTH lines below, and even then nothing is sent automatically:
+  # the pipeline/daemon never submit; only `python main.py submit --app-id N` does.
+  # submission_mode: LIVE
+  # allow_live_submission: true
   # Gmail credentials go in .env:
   #   GMAIL_USER=you@gmail.com
   #   GMAIL_APP_PASSWORD=xxxx xxxx xxxx xxxx

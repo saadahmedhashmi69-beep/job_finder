@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 from urllib.parse import parse_qsl, unquote, urlparse
 
+import safety
 import storage
 from fixed_cv import application_dir_for_slug, resolve_fixed_cv_path
 from qualification import (
@@ -50,6 +51,7 @@ ATS_HOST_PATTERNS = (
     ("bamboohr", re.compile(r"\.bamboohr\.com$")),
     ("jobvite", re.compile(r"^jobs\.jobvite\.com$")),
     ("successfactors", re.compile(r"\.successfactors\.(com|eu)$")),
+    ("avature", re.compile(r"\.avature\.net$")),
 )
 # Boards whose apply flow needs a login / is anti-bot protected: never automated.
 LOGIN_WALLED_HOSTS = ("linkedin.com", "indeed.com", "glassdoor.", "infojobs.net")
@@ -59,6 +61,8 @@ JOB_BOARD_HOSTS = LOGIN_WALLED_HOSTS + (
     "himalayas.app", "remotive.com", "arbeitnow.com", "themuse.com", "talent.com",
     "careerjet.", "trovit.", "jobatus.", "facebook.com", "twitter.com", "x.com", "instagram.com",
 )
+# Multi-tenant careers platforms whose URL path names the employer (…/companies/<employer>/…).
+CAREER_PLATFORM_HOSTS = ("join.com",)
 EMPLOYER = "employer"  # direct employer application page (non-ATS)
 _NO_EMPLOYER = ("", "unknown", "confidential", "confidencial", "n/a")  # company placeholders
 
@@ -90,20 +94,58 @@ def _db(db_path: Optional[Path]) -> Path:
 
 # --- Candidate facts ---------------------------------------------------------
 
+def format_phone(profile: Dict) -> str:
+    """Phone in international format (+<country code><number>), or "" when the
+    profile gives no country code. A local-format number is never written to an
+    employer: it is unusable from another country."""
+    facts = profile.get("candidate_facts") or {}
+    raw = str(profile.get("phone") or "").strip()
+    digits = re.sub(r"\D", "", raw)
+    if not digits:
+        return ""
+    if raw.startswith("+"):
+        return "+" + digits
+    if raw.startswith("00"):
+        return "+" + digits[2:]
+    code = re.sub(r"\D", "", str(facts.get("phone_country_code") or ""))
+    if not code:
+        logger.warning("profile phone has no country code (set candidate_facts.phone_country_code); "
+                       "phone omitted from applications")
+        return ""
+    return f"+{code}{digits.lstrip('0')}"
+
+
 def candidate_facts(profile: Dict) -> Dict:
+    """Facts written into letters/forms. Everything comes from profile.yaml
+    (`candidate_facts` mirrors the CV); nothing is inferred or invented."""
     facts = dict(profile.get("candidate_facts") or {})
     name = (profile.get("name") or "").strip()
     first, _, last = name.partition(" ")
-    location = (profile.get("location") or "").strip()
+    relocating_to = str(facts.get("relocating_to") or "").strip()
+    current = str(facts.get("current_location") or "").strip()
+    # While relocating, the destination is NOT where the candidate is based.
+    location = current if relocating_to else (profile.get("location") or "").strip()
+    if "," in location:
+        city, country = location.split(",")[0].strip(), location.split(",")[-1].strip()
+    elif relocating_to:
+        city, country = "", location
+    else:
+        city, country = location, ""
+    licences = facts.get("driving_licences") or []
+    if isinstance(licences, str):
+        licences = [licences]
     return {
         "full_name": name,
         "first_name": first,
         "last_name": last,
         "email": (profile.get("email") or "").strip(),
-        "phone": str(profile.get("phone") or "").strip(),
+        "phone": format_phone(profile),
         "location": location,
-        "city": location.split(",")[0].strip() if location else "",
-        "country": location.split(",")[-1].strip() if "," in location else "",
+        "city": city,
+        "country": country,
+        "relocating_to": relocating_to,
+        "work_authorisation": str(facts.get("work_authorisation") or "").strip(),
+        "driving_licences": [str(x).strip() for x in licences if str(x).strip()],
         "summary": (facts.get("summary") or "").strip(),
         "linkedin": (profile.get("linkedin") or facts.get("linkedin") or "").strip(),
     }
@@ -119,38 +161,89 @@ def _category_skills(profile: Dict, category: str) -> List[str]:
     return []
 
 
+def _employer_name(job: Dict) -> str:
+    """The employer's real name, or "" when the posting does not give one. A
+    placeholder such as "Unknown"/"Confidencial" is never written as a name."""
+    from fingerprint import is_unnamed_company
+    company = " ".join(str(job.get("company") or "").split())
+    return "" if is_unnamed_company(company) else company
+
+
 def _company_label(job: Dict) -> str:
-    """Employer name for letters; a placeholder such as "Unknown" is never written as a name."""
-    company = (job.get("company") or "").strip()
-    return "your company" if company.lower() in _NO_EMPLOYER else company
+    return _employer_name(job) or "your company"
+
+
+def _job_city(job: Dict) -> str:
+    """City of the vacancy for prose ("Ferrol"), never a bare region/country code ("CT", "ES")."""
+    first = str(job.get("location") or "").split(",")[0].strip()
+    return "" if (len(first) <= 3 and first.upper() == first) else first
 
 
 def generate_cover_letter(job: Dict, profile: Dict, category: str) -> str:
-    """Job-specific, truthful cover letter built only from profile facts."""
+    """Job-specific cover letter built only from profile facts (no LLM).
+
+    No employer name is printed unless the posting names one; the candidate's
+    location is stated as "relocating to ..." when the profile says so, never as
+    "based in" the destination; driving roles cite only the licences listed in
+    the profile and claim no driving employment; the phone is international."""
     f = candidate_facts(profile)
-    title, company = job.get("title") or "the advertised", _company_label(job)
+    title, employer = " ".join(str(job.get("title") or "advertised").split()), _employer_name(job)
+    city = _job_city(job)
     skills = _category_skills(profile, category)
-    lines = [f"Dear Hiring Team at {company},", "",
-             f"I am writing to apply for the {title} position"
-             + (f" in {job['location']}" if job.get("location") else "") + "."]
+    lines = [f"Dear Hiring Team at {employer}," if employer else "Dear Hiring Team,", "",
+             f"I am writing to apply for the {title} position" + (f" in {city}" if city else "") + "."]
     if f["summary"]:
         lines.append(f["summary"])
     if category == "fashion":
         lines.append("My background is in fashion design"
                      + (f", including {', '.join(skills[:6])}" if skills else "") + ".")
-        lines.append(f"I am interested in this role because it centres on womenswear design, "
-                     f"which is the focus of my work, and I would like to contribute to {company}'s collections.")
+        lines.append("I am interested in this role because it centres on womenswear design, which is the "
+                     "focus of my work, and I would like to contribute to "
+                     + (f"{employer}'s collections." if employer else "your collections."))
     elif category == "driver":
-        lines.append("I am applying as a driver"
-                     + (f"; my CV lists {', '.join(skills[:4])}" if skills else "") + ".")
-        lines.append(f"I am reliable and organised, and I would like to support {company}'s driving operations.")
-    if f["location"]:
+        lines.append("I am applying for this driving role.")
+        if f["driving_licences"]:
+            lines.append("My CV lists the following driving licences: " + "; ".join(f["driving_licences"]) + ".")
+        lines.append("I would like to support " + (f"{employer}'s" if employer else "your")
+                     + " driving operations.")
+    if f["relocating_to"]:
+        lines.append(f"I am relocating to {f['relocating_to']}"
+                     + (f" with {f['work_authorisation']}" if f["work_authorisation"] else "") + ".")
+    elif f["location"]:
         lines.append(f"I am based in {f['location']}.")
     lines += ["My CV is attached with full details of my experience. "
               "I would welcome the opportunity to discuss the role with you.", "",
               "Kind regards,", f["full_name"]]
     lines += [x for x in (f["email"], f["phone"]) if x]
     return "\n".join(lines).strip() + "\n"
+
+
+_UNKNOWN_EMPLOYER_TEXT = re.compile(r"\b(?:at|to|for)\s+(?:unknown|confidential|confidencial|n/a|none)\b"
+                                    r"|\b(?:unknown|confidential|confidencial)'s\b|\bat your company,", re.I)
+_LOCAL_PHONE_LINE = re.compile(r"^\s*(?!\+)[\d(][\d\s().-]{6,}\s*$", re.M)
+
+
+def letter_problems(letter: str, profile: Dict) -> List[str]:
+    """Grounding check run before any letter is sent. Returns the problems found
+    (empty = none): placeholder employer written as a name, "based in" the
+    relocation destination, or a phone number without a country code."""
+    f = candidate_facts(profile)
+    problems = []
+    if _UNKNOWN_EMPLOYER_TEXT.search(letter or ""):
+        problems.append("placeholder employer name in the letter")
+    if f["relocating_to"] and re.search(rf"\bbased in {re.escape(f['relocating_to'].split(',')[0])}", letter or "", re.I):
+        problems.append("letter claims the candidate is based in the relocation destination")
+    if _LOCAL_PHONE_LINE.search(letter or ""):
+        problems.append("phone number without a country code")
+    if not f["full_name"] or f["full_name"] not in (letter or ""):
+        problems.append("candidate name missing from the letter")
+    return problems
+
+
+def application_subject(job: Dict, profile: Dict) -> str:
+    """Single-line subject (newlines in a scraped title can never add headers)."""
+    return " ".join(f"Application for {job.get('title') or 'the advertised position'} - "
+                    f"{candidate_facts(profile)['full_name']}".split())
 
 
 def generate_form_answers(job: Dict, profile: Dict, category: str, cover_letter: str) -> Dict[str, str]:
@@ -161,29 +254,103 @@ def generate_form_answers(job: Dict, profile: Dict, category: str, cover_letter:
                                  "phone", "location", "city", "country", "linkedin") if f[k]}
     answers["cover_letter"] = cover_letter
     answers["why_interested"] = (
-        f"I am applying for the {job.get('title', 'role')} role at {_company_label(job)} "
+        f"I am applying for the {job.get('title', 'role')} role"
+        + (f" at {_employer_name(job)} " if _employer_name(job) else " ")
         + ("because it is a womenswear design role, which matches my fashion design background."
-           if category == "fashion" else "because it is a driving role that matches my CV.")
+           if category == "fashion" else
+           ("because it is a driving role and my CV lists my driving licences." if f["driving_licences"]
+            else "because it is a driving role."))
     )
     return answers
 
 
 # --- Application method ------------------------------------------------------
 
+# Role mailboxes that are not where applications go (privacy, legal, support...).
+_ROLE_MAILBOX = re.compile(
+    r"^(privacy|privacidad|dpo|dpd|lopd|rgpd|gdpr|data[-_.]?protection|proteccion[-_.]?(de[-_.]?)?datos|"
+    r"protecciondedatos|legal|compliance|support|soporte|help|helpdesk|ayuda|abuse|postmaster|webmaster|"
+    r"mailer-daemon|newsletter|marketing|press|prensa|billing|facturacion|unsubscribe|baja|bajas|"
+    r"accessib\w*|accommodation\w*|arco|derechos\w*|security|seguridad|admin|administrator|root)"
+    r"([-_.+].*)?$", re.I)
+# Words that make a sentence an instruction to apply / send a CV.
+_APPLY_CONTEXT = re.compile(
+    r"\b(cv|c\.v\.?|curr[ií]cul\w*|candidaturas?|solicitud(es)?|resum[eé]s?|apply|applying|applications?|"
+    r"aplica\w*|postul\w*|inscr[ií]b\w*|interesad\w*)\b", re.I)
+# "... send/envía ... CV/candidatura ... to <address>": the address is explicitly the application contact.
+_EXPLICIT_APPLY = re.compile(
+    r"\b(env[ií]a\w*|enviar\w*|mand[ae]\w*|remit\w*|send|submit|e-?mail|forward)\b[^@\n]{0,80}"
+    r"\b(cv|c\.v\.?|curr[ií]cul\w*|candidaturas?|solicitud|resum[eé]|applications?)\b[^@\n]{0,40}$", re.I)
+_NO_EMAIL_APPLICATIONS = re.compile(
+    r"\b(no (enviar|env[ií]es|env[ií]en|mandar|mandes|remitir)|do not (send|e-?mail)|don.?t (send|e-?mail)|"
+    r"no se (aceptan|admiten|reciben)|(we )?(do not|don.?t|cannot) accept|not accept\w*)\b[^.\n]{0,80}"
+    r"\b(cvs?|curr[ií]cul\w*|candidaturas?|applications?|resum[eé]s?|e-?mail|correo)\b", re.I)
+_PRIVACY_CONTEXT = re.compile(
+    r"protecci[oó]n de datos|data protection|privacy|privacidad|rgpd|gdpr|lopd|derechos? (de )?(acceso|arco)|"
+    r"ejerc\w+ (sus|tus|los) derechos|delegado de protecci|data controller|responsable del? (tratamiento|datos)|"
+    r"unsubscribe|darse de baja|accommodation|accessib|discapacidad|reasonable adjust|"
+    r"solicitud de (acceso|rectificaci|supresi|oposici)", re.I)
+_INJECTION_TEXT = re.compile(r"ignore (all |any )?(previous|prior|above) (instructions|rules)|system prompt|"
+                             r"disregard (the |all )?(above|previous)|you are an? (ai|assistant|language model)", re.I)
+_SENTENCE_END = re.compile(r"[.!?:;]\s+|\n")
+
+
+def _email_domain_ok(email: str) -> bool:
+    domain = email.rpartition("@")[2].lower()
+    labels = domain.split(".")
+    return (len(labels) >= 2 and all(labels) and labels[-1].isalpha() and not domain.startswith("xn--")
+            and not any(lab.startswith("xn--") for lab in labels)
+            and not re.fullmatch(r"[\d.]+", domain) and len(email) <= 120)
+
+
 def find_application_email(job: Dict, recruiter_email: str = "") -> str:
-    """A legitimate email printed in the job posting itself. A recruiter_email
-    set on the application is used only if the posting contains it too.
-    Placeholder/test addresses are rejected; nothing is ever guessed."""
-    posted = []
-    for candidate in _EMAIL_RE.findall(job.get("description") or ""):
-        candidate = candidate.strip().rstrip(".")
-        if not _BAD_EMAIL.search(candidate) and not is_placeholder_email(candidate):
-            posted.append(candidate)
+    """The address the posting itself names as the place to send an application.
+
+    An address is accepted only when its own sentence is an instruction to
+    apply / send a CV. Privacy, legal, support and no-reply mailboxes are
+    accepted only when the sentence explicitly says to send the CV to them, and
+    never inside a data-protection sentence. A posting that says not to apply
+    by email, that carries prompt-injection text, or that names several
+    different application addresses yields "" (-> MANUAL_REQUIRED).
+    A recruiter_email set on the application is used only if the posting
+    confirms it. Nothing is ever guessed."""
+    text = job.get("description") or ""
+    if _NO_EMAIL_APPLICATIONS.search(text) or _INJECTION_TEXT.search(text):
+        return ""
+    accepted, explicit = [], []
+    for m in _EMAIL_RE.finditer(text):
+        email = m.group(0).strip().rstrip(".")
+        if _BAD_EMAIL.search(email) or is_placeholder_email(email) or not _email_domain_ok(email):
+            continue
+        before = text[max(0, m.start() - 220):m.start()]
+        pieces = _SENTENCE_END.split(before)
+        sentence = pieces[-1]
+        if len(sentence.strip(" *_-•\t")) < 12 and len(pieces) > 1:
+            sentence = pieces[-2] + " " + sentence  # "Interesados:\n<address>"
+        tail = _SENTENCE_END.split(text[m.end():m.end() + 80])[0]
+        if _PRIVACY_CONTEXT.search(sentence):
+            continue
+        is_explicit = bool(_EXPLICIT_APPLY.search(sentence))
+        if _ROLE_MAILBOX.match(email.rpartition("@")[0]):
+            # Role mailboxes: explicit "send your CV to" wording, and no data-protection
+            # context anywhere nearby ("Protección de datos: envía tu solicitud a gdpr@...").
+            if not is_explicit or _PRIVACY_CONTEXT.search(before[-160:]):
+                continue
+        elif not (_APPLY_CONTEXT.search(sentence) or _APPLY_CONTEXT.search(tail)):
+            continue
+        if email.lower() not in [a.lower() for a in accepted]:
+            accepted.append(email)
+            if is_explicit:
+                explicit.append(email)
     wanted = (recruiter_email or "").strip().lower()
-    for candidate in posted:
-        if candidate.lower() == wanted:
-            return candidate
-    return posted[0] if posted else ""
+    for email in accepted:
+        if email.lower() == wanted:
+            return email
+    if len(accepted) == 1:
+        return accepted[0]
+    if len(explicit) == 1:
+        return explicit[0]
+    return ""  # none, or several candidates with no single explicit one: a human decides
 
 
 def _host(url: str) -> str:
@@ -261,13 +428,17 @@ def _routes_in_text(text: str, source: str, *, employer_ok: bool) -> List[Dict]:
 def _http_fetch(url: str):
     """GET a public page (follows public redirects). Returns (final_url, html) or None.
     No cookies, no login, no anti-bot workarounds: a blocked page just yields None."""
+    ok, why = safety.resolves_to_public(url)
+    if not ok:  # never fetch localhost / private addresses named in untrusted posting text
+        logger.warning("Route discovery refused to fetch %s: %s", url, why)
+        return None
     try:
         import requests
         resp = requests.get(url, timeout=12, allow_redirects=True, headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                           "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
             "Accept-Language": "es-ES,es;q=0.9,en;q=0.8"})
-        if resp.status_code != 200:
+        if resp.status_code != 200 or not safety.is_safe_public_url(resp.url):
             return None
         return resp.url, resp.text
     except Exception as e:  # network errors: route stays undiscovered
@@ -324,6 +495,57 @@ def discover_application_route(job: Dict, fetch: Optional[Callable] = None) -> D
     return {"route_type": "", "url": "", "source": "", "reason": ""}
 
 
+def url_names_employer(url: str, company: str) -> bool:
+    """The URL itself carries the employer's name: in the host
+    (empleo.mercadona.es, acme.teamtailor.com) or in the path of an ATS / careers
+    platform (jobs.lever.co/acme/..., join.com/companies/acme/...)."""
+    from employer_routes import _GENERIC_COMPANY, _company_tokens, _host_is_employer, is_unnamed
+    if is_unnamed(company):
+        return False
+    if _host_is_employer(url, company):
+        return True
+    # A name in the path only counts on multi-tenant ATS/careers platforms, where
+    # the path segment identifies the tenant; on any other host it proves nothing.
+    host = _host(url)
+    if not (ats_for_url(url) or any(host == h or host.endswith("." + h) for h in CAREER_PLATFORM_HOSTS)):
+        return False
+    path = re.sub(r"[^a-z0-9]", "", urlparse(url).path.lower())
+    tokens = _company_tokens(company)
+    slug = "".join(tokens)
+    if len(slug) >= 5 and slug in path:
+        return True
+    return any(len(t) >= 5 and t not in _GENERIC_COMPANY and t in path for t in tokens)
+
+
+def verify_route(job: Dict, route: Dict, fetch: Optional[Callable] = None) -> str:
+    """'' when the WEB route may be used, else why not.
+
+    The URL must be a safe public http(s) URL, and must belong to this employer
+    and vacancy: it is the posting itself, or its host/path names the employer,
+    or the fetched page is verifiably this vacancy (job title + employer +
+    location/reference/text overlap). A URL that merely appears in untrusted
+    posting text is never enough."""
+    url = route.get("url") or ""
+    ok, why = safety.check_public_url(url)
+    if not ok:
+        return f"unsafe application URL ({why})"
+    if is_job_board(url):
+        return "application URL is a job board, not the employer/ATS"
+    if route.get("source") in ("job_url", "employer_search"):
+        return ""  # the posting's own page / already verified by employer_routes
+    if url_names_employer(url, job.get("company") or ""):
+        return ""
+    if fetch:
+        page = fetch(url)
+        if page and safety.is_safe_public_url(page[0]) and not is_job_board(page[0]):
+            from employer_routes import _same_vacancy
+            _, missing = _same_vacancy(job, page[0], page[1])
+            if not missing:
+                return ""
+    return ("ownership of the application URL could not be established (its host/path does not name "
+            "the employer and the page is not verifiably this vacancy)")
+
+
 def detect_application_method(job: Dict, recruiter_email: str = "", fetch: Optional[Callable] = None,
                               search: Optional[Callable] = None) -> Dict:
     """Return {method: WEB|EMAIL|MANUAL_REQUIRED, ats, route_type, url, source, email, reason}.
@@ -332,22 +554,33 @@ def detect_application_method(job: Dict, recruiter_email: str = "", fetch: Optio
     postings; without it no network is used. With `search`
     ((query, max_results) -> [url]) as well, a job that would otherwise be
     MANUAL_REQUIRED gets one bounded employer route search first
-    (employer_routes.discover_employer_route).
+    (employer_routes.discover_employer_route). Every WEB route must pass
+    verify_route(); an unverified URL is never used.
     """
     url = (job.get("url") or "").strip()
     email = find_application_email(job, recruiter_email)
     route = discover_application_route(job, fetch=fetch)
+    rejected = ""
     if route["url"]:
-        return {"method": WEB, "ats": route["route_type"], "email": email, **route}
+        rejected = verify_route(job, route, fetch=fetch)
+        if not rejected:
+            return {"method": WEB, "ats": route["route_type"], "email": email, **route}
+        rejected = f"Application URL {route['url']} rejected: {rejected}. "
+        logger.warning("Route rejected for %s: %s", job.get("title"), rejected)
     if email:
         return {"method": EMAIL, "ats": "", "route_type": "email", "url": "", "source": "description",
                 "email": email, "reason": "Application email in posting"}
-    if _host(url) and not is_job_board(url):
-        return {"method": WEB, "ats": "generic", "route_type": EMPLOYER, "url": url, "source": "job_url",
-                "email": "", "reason": "Generic web form (attempted; stops as MANUAL_REQUIRED if unsupported)"}
-    reason = ("No public application route: the job-board posting (LinkedIn/Indeed/...) exposes no "
-              "employer/ATS application URL and no application email" if _host(url)
-              else "No application URL or email")
+    if _host(url) and not is_job_board(url) and not rejected:
+        generic = {"route_type": EMPLOYER, "url": url, "source": "job_url"}
+        problem = verify_route(job, generic)
+        if not problem:
+            return {"method": WEB, "ats": "generic", **generic, "email": "",
+                    "reason": "Generic web form (attempted; stops as MANUAL_REQUIRED if unsupported)"}
+        rejected = f"Job URL rejected: {problem}. "
+    reason = rejected + (
+        "No public application route: the job-board posting (LinkedIn/Indeed/...) exposes no "
+        "employer/ATS application URL and no application email" if _host(url)
+        else "No application URL or email")
     employer = ""
     if fetch and search:
         # Last resort: the same vacancy on the employer's own site / a public ATS.
@@ -383,15 +616,16 @@ def prepare_application(job: Dict, profile: Dict, *, matcher=None,
     qualification status when not qualified, or the application status.
     """
     db = _db(db_path)
-    existing = storage.find_existing_application(job["url"], job.get("title", ""),
-                                                 job.get("company", ""), db_path=db)
+    existing = storage.find_existing_application(
+        job["url"], job.get("title") or "", job.get("company") or "", location=job.get("location") or "",
+        description=job.get("description") or "", db_path=db)
     if existing:
         # A route-less MANUAL_REQUIRED application is re-checked for a public
         # employer/ATS route and updated in place; anything else (e.g.
         # READY_TO_SUBMIT) is left untouched and reported as a duplicate.
         if needs_route(existing) and _job_qualified(existing["job_url"], db):
             return reroute_application(existing, dict(job, url=existing["job_url"]), profile=profile,
-                                       db_path=db, fetch=fetch or _http_fetch, search=search)
+                                       db_path=db, fetch=fetch or _http_fetch, search=search, matcher=matcher)
         return {"status": "DUPLICATE", "app_id": existing["id"],
                 "reasons": [f"Already has application #{existing['id']} ({existing['status']})"],
                 "method": existing.get("application_method", "")}
@@ -419,13 +653,17 @@ def prepare_application(job: Dict, profile: Dict, *, matcher=None,
     storage.update_application(
         app_id, db_path=db, status=APPLICATION_PREPARED, cv_pdf_path=str(cv_path),
         cv_sha256=cv_hash, form_answers_json=json.dumps(answers),
-        email_subject=f"Application for {job.get('title', '')} - {candidate_facts(profile)['full_name']}",
+        email_subject=application_subject(job, profile),
         email_body=letter,
     )
 
     method = detect_application_method(job, fetch=fetch or _http_fetch, search=search or _web_search)
     _save_resolved_employer(job["url"], method.get("employer", ""), db)
     status = MANUAL_REQUIRED if method["method"] == MANUAL_REQUIRED else READY_TO_SUBMIT
+    problems = letter_problems(letter, profile)
+    if problems:  # never READY with content that is not grounded in the profile
+        status = MANUAL_REQUIRED
+        method = dict(method, reason=f"Application content not grounded: {'; '.join(problems)}. {method['reason']}")
     storage.update_application(
         app_id, db_path=db, status=status, application_method=method["method"],
         recruiter_email=method["email"], status_reason=method["reason"],
@@ -452,7 +690,7 @@ def _job_qualified(job_url: str, db: Path) -> bool:
 
 def reroute_application(app: Dict, job: Dict, *, profile: Optional[Dict] = None,
                         db_path: Optional[Path] = None, fetch: Optional[Callable] = None,
-                        search: Optional[Callable] = None) -> Dict:
+                        search: Optional[Callable] = None, matcher=None) -> Dict:
     """Re-run route discovery for an existing route-less MANUAL_REQUIRED
     application and update it in place. Uses the job URL, the posting
     description, the board apply URL and any URL already saved on the
@@ -463,6 +701,15 @@ def reroute_application(app: Dict, job: Dict, *, profile: Optional[Dict] = None,
     Returns the same shape as prepare_application."""
     db = _db(db_path)
     app_id = app["id"]
+    if profile is not None:
+        # The job was qualified under the rules of that day; it must still pass today's.
+        q = qualify_job(job, profile, matcher=matcher)
+        if q.status != QUALIFIED:
+            storage.set_job_qualification(app["job_url"], q.status, q.category, q.reasons, db_path=db)
+            reason = f"No longer passes qualification ({q.status}): {'; '.join(q.reasons)}"
+            storage.update_application(app_id, db_path=db, status_reason=reason)
+            return {"status": MANUAL_REQUIRED, "app_id": app_id,
+                    "reasons": [f"Existing application #{app_id}: {reason}"], "method": MANUAL_REQUIRED}
     job = dict(job, apply_url=job.get("apply_url") or app.get("application_url") or "")
     method = detect_application_method(job, fetch=fetch or _http_fetch, search=search or _web_search)
     _save_resolved_employer(app["job_url"], method.get("employer", ""), db)
@@ -493,9 +740,11 @@ def reroute_application(app: Dict, job: Dict, *, profile: Optional[Dict] = None,
 
 
 def reroute_manual_applications(db_path: Optional[Path] = None, fetch: Optional[Callable] = None,
-                                search: Optional[Callable] = None) -> int:
+                                search: Optional[Callable] = None, profile: Optional[Dict] = None,
+                                matcher=None) -> int:
     """Re-run route discovery for QUALIFIED jobs whose application is MANUAL_REQUIRED
     only because no route was known. A found route makes it READY_TO_SUBMIT.
+    With `profile`, each job is first re-qualified under the current rules.
     Nothing is submitted. Returns the number of applications re-routed."""
     db = _db(db_path)
     conn = storage.get_db(db)
@@ -509,6 +758,7 @@ def reroute_manual_applications(db_path: Optional[Path] = None, fetch: Optional[
         app = storage.get_application_by_job(row["url"], db_path=db)
         if not app or app["id"] != row["app_id"] or not needs_route(app):
             continue
-        if reroute_application(app, row, db_path=db, fetch=fetch, search=search)["status"] == READY_TO_SUBMIT:
+        if reroute_application(app, row, profile=profile, db_path=db, fetch=fetch, search=search,
+                               matcher=matcher)["status"] == READY_TO_SUBMIT:
             rerouted += 1
     return rerouted

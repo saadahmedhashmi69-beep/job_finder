@@ -200,7 +200,8 @@ def send_review_email(
             msg.attach(part)
 
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        from applier import smtp_timeout
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=smtp_timeout()) as server:
             server.login(gmail_user, gmail_app_password)
             server.send_message(msg)
         logger.info("Review email sent for %s", title)

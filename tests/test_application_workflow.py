@@ -132,6 +132,10 @@ class WorkflowBase(unittest.TestCase):
         self.profile["pipeline"].update({"fixed_cv_path": str(FIXED_CV), "cv_dir": str(self.tmp / "cv")})
         self.profile["pipeline"].pop("submission_mode", None)
         self.profile["pipeline"].pop("allow_live_submission", None)
+        # Fixture candidate: holds a class B licence valid in Spain, so the driver flow can be
+        # exercised. The real profile's eligibility is covered by test_hardening / real-data tests.
+        self.profile["candidate_facts"] = dict(self.profile.get("candidate_facts") or {},
+                                               licences_valid_in_spain=["B"])
         for p in (mock.patch.object(matcher.JobMatcher, "_semantic_score", return_value=0.5),
                   mock.patch.object(matcher, "load_life_story", return_value=""),
                   # 9. Normal flow never touches CV customisation.
@@ -267,13 +271,17 @@ class TestSubmission(WorkflowBase):
         self.assertEqual(submitter.get_submission_mode({"pipeline": {"submission_mode": "LIVE"}}),
                          submitter.DRY_RUN)
 
-    def test_dry_run_fills_uploads_fixed_cv_and_never_submits(self):
+    def test_dry_run_maps_fields_and_touches_nothing(self):
+        # DRY_RUN is inspection only: nothing is typed, uploaded or clicked.
         app_id, page = self.ready_app(), FakePage(SIMPLE_FORM)
         res = self.submit(app_id, page, mode=submitter.LIVE)  # LIVE not enabled -> DRY_RUN
         self.assertEqual(res["status"], submitter.DRY_RUN_VALIDATED)
         self.assertFalse(page.clicked)
-        self.assertEqual([Path(p) for p in page.uploads], [FIXED_CV])
-        self.assertIn(self.profile["email"], page.filled.values())
+        self.assertEqual((page.uploads, page.filled), ([], {}))
+        rep = res["report"]
+        self.assertEqual(rep["cv_uploaded"], "")
+        self.assertIn(FIXED_CV.name, rep["would_submit"].values())
+        self.assertIn(self.profile["email"], rep["would_submit"].values())
         self.assertEqual(self.app_row(app_id)["status"], READY_TO_SUBMIT)
 
     def enable_live(self):
