@@ -209,7 +209,21 @@ class JobMatcher:
             "title_include": [re.compile(r) for r in cat.get("title_include", []) or []],
             "title_exclude": [re.compile(r) for r in cat.get("title_exclude", []) or []],
             "evidence_rules": JobMatcher._prepare_evidence_rules(cat),
+            "semantic_text": cat.get("semantic_profile") or JobMatcher._category_profile_text(cat),
+            "semantic_embedding": None,  # lazy computed
         }
+
+    @staticmethod
+    def _category_profile_text(cat: dict) -> str:
+        """Fallback semantic reference for a category: its titles/skills/keywords."""
+        parts = []
+        if cat.get("titles"):
+            parts.append("Desired roles: " + ", ".join(cat["titles"]))
+        if cat.get("skills"):
+            parts.append("Skills: " + ", ".join(cat["skills"]))
+        if cat.get("keywords"):
+            parts.append("Expertise in: " + ", ".join(cat["keywords"]))
+        return " ".join(parts)
 
     @staticmethod
     def _prepare_evidence_rules(cat: dict) -> list:
@@ -277,9 +291,20 @@ class JobMatcher:
             self._profile_embedding = model.encode(self._profile_text, normalize_embeddings=True)
         return self._profile_embedding
 
-    def _semantic_score(self, job: Job) -> float:
-        """Compute semantic similarity between profile and job using embeddings."""
-        profile_emb = self._get_profile_embedding()
+    def _get_category_embedding(self, cat: dict):
+        """Compute and cache a category's semantic reference embedding."""
+        if cat["semantic_embedding"] is None:
+            model = _get_model()
+            cat["semantic_embedding"] = model.encode(cat["semantic_text"], normalize_embeddings=True)
+        return cat["semantic_embedding"]
+
+    def _semantic_score(self, job: Job, category: dict | None = None) -> float:
+        """Compute semantic similarity between the profile (or a category's
+        reference text, when given) and the job using embeddings."""
+        if category is not None:
+            profile_emb = self._get_category_embedding(category)
+        else:
+            profile_emb = self._get_profile_embedding()
 
         # Use cached embedding from batch encoding if available
         if hasattr(job, '_cached_embedding'):
@@ -333,8 +358,12 @@ class JobMatcher:
                 title_tf, job_tf, job_text, [tf(self._title_tokens)],
                 self._skill_tokens, self._specialty_keywords)
 
-        # 3. Semantic similarity — deep embedding-based matching
-        semantic_score = self._semantic_score(job)
+        # 3. Semantic similarity — deep embedding-based matching. Once the scope
+        # gate has placed the job in a category, compare against that category's
+        # reference text; rejected/unplaced jobs use the global profile (and
+        # rejected jobs still score 0 below).
+        semantic_category = category if category is not None and not rejected_reason else None
+        semantic_score = self._semantic_score(job, semantic_category)
 
         # 4. Location match
         location_score = self._location_score(job)
@@ -410,6 +439,7 @@ class JobMatcher:
             "category": category["name"] if category else "",
             "requirement_flags": requirement_flags,
             "rejected_reason": rejected_reason,
+            "semantic_reference": semantic_category["name"] if semantic_category else "global",
             "weighted_total": round(total, 3),
         }
 

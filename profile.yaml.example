@@ -44,6 +44,9 @@ keywords:
 #     skills: [fashion sketching, fabric selection]
 #     keywords: [fashion, apparel, garment]
 #   - name: driver
+#     # Optional semantic reference text, used (instead of the global profile)
+#     # once the job is placed in this category. Defaults to titles+skills+keywords.
+#     semantic_profile: "Driver, delivery driver, chauffeur. Driving a van or car, passenger transport."
 #     titles: [driver, delivery driver, chauffeur]
 #     skills: [driving]
 #     keywords: [driver, delivery, van]
